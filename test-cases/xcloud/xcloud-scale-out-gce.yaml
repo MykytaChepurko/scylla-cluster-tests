@@ -1,0 +1,25 @@
+test_duration: 120
+stress_cmd: ["cassandra-stress write n=37000000 cl=QUORUM -schema 'replication(strategy=NetworkTopologyStrategy,replication_factor=3)' -mode cql3 native -rate threads=100 -col 'n=FIXED(10) size=FIXED(900)' -pop seq=1..37000000 -log interval=5"]
+
+xcloud_replication_factor: 3
+n_loaders: 1
+
+n_monitor_nodes: 1
+
+user_prefix: 'xcloud-scale-out-test-gce'
+
+scaling_config: {
+    "InstanceFamilies": [
+      "n2"
+    ],
+    "Mode": "xcloud",
+    "Policies": {
+      "Storage": {
+        "Min": 0,
+        "TargetUtilization": 0.8
+      },
+      "VCPU": {
+        "Min": 0
+      }
+    }
+}
