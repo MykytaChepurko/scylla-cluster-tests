@@ -8,9 +8,9 @@ n_monitor_nodes: 1
 
 user_prefix: 'xcloud-scale-out-aws-80-75'
 instance_provision: 'on_demand'
-scylla_version: '2026.1.0'
+scylla_version: '2026.1.2'
 
-scaling_config: {
+xcloud_scaling_config: {
     "InstanceFamilies": [
       "i4i"
     ],
