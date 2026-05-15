@@ -1,7 +1,9 @@
 test_duration: 800
-prepare_write_cmd: ["cassandra-stress write n=42500000 cl=QUORUM -schema 'replication(strategy=NetworkTopologyStrategy,replication_factor=3)' -mode cql3 native -rate threads=100 -col 'n=FIXED(10) size=FIXED(900)' -pop seq=1..42500000 -log interval=5"]
 
-stress_cmd: "cassandra-stress mixed no-warmup cl=QUORUM duration=800m -schema 'replication(strategy=NetworkTopologyStrategy,replication_factor=3)' -mode cql3 native -rate 'threads=100 fixed=3300/s' -col 'size=FIXED(10) n=FIXED(900)' -pop 'dist=gauss(1..180000000,90000000,1800000)'"
+stress_cmd: [
+"scylla-bench -workload=sequential -mode=mixed -replication-factor=3 -partition-count=85000000 -clustering-row-count=1 -clustering-row-size=9000 -concurrency=100 -timeout=180s -connection-count=100 -retry-number=10 -retry-interval=40s -duration=90m"
+]
+
 
 xcloud_replication_factor: 3
 n_loaders: 1
