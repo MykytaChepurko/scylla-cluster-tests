@@ -16,7 +16,7 @@ scylla_version: '2026.1.2'
 
 scaling_config: {
     "InstanceFamilies": [
-      "i4i"
+      "i8g"
     ],
     "Mode": "xcloud",
     "Policies": {
