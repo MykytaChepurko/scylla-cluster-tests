@@ -41,6 +41,7 @@ class ScyllaBenchModes(str, Enum):
     COUNTER_UPDATE = "counter_update"
     COUNTER_READ = "counter_read"
     SCAN = "scan"
+    MIXED = "mixed"
 
 
 class ScyllaBenchWorkloads(str, Enum):
