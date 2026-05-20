@@ -6,7 +6,7 @@ n_loaders: 1
 
 n_monitor_nodes: 1
 
-user_prefix: 'xcloud-scale-out-aws-i8g-80-50'
+user_prefix: 'scale-out-aws-i8g-80-50'
 instance_provision: 'on_demand'
 scylla_version: '2026.1.2'
 
