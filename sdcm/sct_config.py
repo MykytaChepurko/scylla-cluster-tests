@@ -4431,7 +4431,7 @@ class SCTConfiguration(BaseModel):
         n_nodes = _n_db_nodes if isinstance(_n_db_nodes, list) else [_n_db_nodes]
         if rf is None:
             self["xcloud_replication_factor"] = min(*n_nodes, 3)
-        elif rf > n_nodes:
+        elif rf > 3:
             raise ValueError(f"xcloud_replication_factor ({rf}) cannot be greater than n_db_nodes ({n_nodes})")
 
         # validate Vector Search parameters for cloud backend
