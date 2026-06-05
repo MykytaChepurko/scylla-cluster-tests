@@ -35,7 +35,8 @@ from distutils.util import strtobool
 import anyconfig
 from argus.client.sct.types import Package
 from packaging import version
-from pydantic import BaseModel, Field, ConfigDict, fields as pydantic_fields
+from pydantic import BaseModel, Field, ConfigDict, RootModel, fields as pydantic_fields, model_validator
+from pydantic.types import confloat
 from typing_extensions import Annotated
 from pydantic.functional_validators import BeforeValidator
 from pydantic.fields import FieldInfo
@@ -75,9 +76,9 @@ from sdcm.utils.version_utils import (
 )
 from sdcm.sct_events.base import add_severity_limit_rules, print_critical_events
 from sdcm.utils.gce_utils import (
-    SUPPORTED_REGIONS as GCE_SUPPORTED_REGIONS,
     get_gce_image_tags,
     get_gce_compute_machine_types_client,
+    get_gce_compute_regions_client,
     gce_check_if_machine_type_supported,
 )
 from sdcm.utils.azure_utils import (
@@ -264,6 +265,52 @@ def dict_or_str(value: dict | str | None) -> dict | None:
 DictOrStr = Annotated[dict | str, BeforeValidator(dict_or_str)]
 
 
+class AdaptiveTimeoutMultipliers(RootModel):
+    """Per-operation multipliers for adaptive timeouts.
+
+    Keys must be valid operation names from Operations enum (operation.value[0]),
+    e.g. decommission, remove_node, new_node, repair, rebuild, etc.
+    Missing keys default to multiplier 1.
+
+    YAML config example::
+
+        adaptive_timeout_multipliers:
+          decommission: 4
+          new_node: 4
+          remove_node: 4
+
+    Environment variable examples:
+
+        SCT_ADAPTIVE_TIMEOUT_MULTIPLIERS="{'decommission': 2, 'new_node': 3}"
+
+    Or using dot-notation (same pattern as SCT_STRESS_IMAGE.*):
+
+        SCT_ADAPTIVE_TIMEOUT_MULTIPLIERS.decommission=4
+        SCT_ADAPTIVE_TIMEOUT_MULTIPLIERS.new_node=3
+    """
+
+    root: dict[str, confloat(gt=0)] = Field(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _validate_operations(cls, value):
+        if not isinstance(value, dict):
+            return value
+
+        # cyclic-import: Operations imports from sct_config indirectly via cluster
+        from sdcm.utils.adaptive_timeouts import Operations  # noqa: PLC0415
+
+        valid_keys = {op.value[0] for op in Operations}
+        for key in value.keys():
+            if key not in valid_keys:
+                raise ValueError(f"Unknown operation key '{key}'. Valid keys: {sorted(valid_keys)}")
+        return value
+
+    def get_multiplier(self, operation_key: str) -> float:
+        """Return multiplier for the given operation key, or 1.0 if not configured."""
+        return float(self.root.get(operation_key, 1.0))
+
+
 def dict_or_str_or_pydantic(value: dict | str | BaseModel | None) -> dict | BaseModel | None:
     if value is None:
         return None
@@ -397,6 +444,7 @@ AWS_SUPPORTED_REGIONS: list[str] = [
     "eu-west-3",
     "us-west-2",
     "us-east-1",
+    "us-east-2",
     "eu-north-1",
     "eu-central-1",
 ]
@@ -424,7 +472,7 @@ def count_regions(region_string: str) -> int:
         regions = json.loads(region_string.replace("'", '"'))
         if isinstance(regions, list):
             return len(regions)
-    except (json.JSONDecodeError, ValueError):
+    except json.JSONDecodeError, ValueError:
         # Not a JSON array — fall through to treat as a plain string
         pass
     if " " in region_string:
@@ -760,6 +808,10 @@ class SCTConfiguration(BaseModel):
         description="instance_provision_fallback_on_demand: create instance on_demand provision type if instance with selected "
         "'instance_provision' type creation failed. "
         "Expected values: true|false (default - false",
+    )
+    enable_kernel_panic_checker: Boolean = SctField(
+        description="Enable kernel panic detection by monitoring cloud instance console output for panic indicators. "
+        "When enabled, a background thread monitors each node's console output for kernel panic patterns.",
     )
     reuse_cluster: String = SctField(
         description="""
@@ -1258,6 +1310,20 @@ class SCTConfiguration(BaseModel):
     adaptive_timeout_store_metrics: Boolean = SctField(
         description="Store adaptive timeout metrics in Argus. Disabled for performance tests only.",
     )
+    adaptive_timeout_multipliers: Annotated[AdaptiveTimeoutMultipliers, BeforeValidator(dict_or_str_or_pydantic)] = (
+        SctField(
+            description="Optional dict of adaptive-timeout multipliers keyed by operation name "
+            "(from Operations enum value[0], e.g. decommission, remove_node, new_node, repair, etc.). "
+            "If the current operation key is absent, multiplier 1.0 is used.<br>"
+            "YAML example:<br>"
+            "adaptive_timeout_multipliers:<br>"
+            "  decommission: 4<br>"
+            "  new_node: 2<br>"
+            "Environment variable examples:<br>"
+            "SCT_ADAPTIVE_TIMEOUT_MULTIPLIERS=\"{'decommission': 4, 'new_node': 2}\"<br>"
+            "Or dot-notation: SCT_ADAPTIVE_TIMEOUT_MULTIPLIERS.decommission=4",
+        )
+    )
 
     # Google Compute Engine options
     gce_n_local_ssd_disk_monitor: int = SctField(
@@ -1726,6 +1792,11 @@ class SCTConfiguration(BaseModel):
     cs_debug: Boolean = SctField(
         description="enable debug for cassandra-stress",
     )
+    cs_extra_jvm_opts: String = SctField(
+        description="Extra JVM options passed to cassandra-stress via JVM_OPTS environment variable. "
+        "Recommended for low-latency: '-XX:+UseZGC -XX:+ZGenerational -Xms8g -Xmx8g -XX:+AlwaysPreTouch' "
+        "(requires Java 21+, which cassandra-stress 3.20.6+ ships with).",
+    )
     stress_cmd_mv: StringOrList = SctField(
         description="cassandra-stress commands. You can specify everything but the -node parameter, which is going to be provided by the test suite infrastructure. Multiple commands can be passed as a list",
     )
@@ -1978,7 +2049,21 @@ class SCTConfiguration(BaseModel):
               "Same for multi-region scenario.""",
     )
     aws_fallback_to_next_availability_zone: Boolean = SctField(
-        description="Try all availability zones one by one in order to maximize the chances of getting the requested instance capacity.",
+        description="Deprecated alias of `fallback_to_next_availability_zone`. Kept for backward compatibility.",
+    )
+    fallback_to_next_availability_zone: Boolean = SctField(
+        description="On capacity errors, automatically retry provisioning in the next available AZ in the same region. "
+        "Backend-agnostic parameter; supersedes `aws_fallback_to_next_availability_zone`.",
+    )
+    pre_filter_unavailable_availability_zones: Boolean = SctField(
+        description="Filter availability zones upfront to only those that support all required instance types. "
+        "Replaces invalid AZs with valid alternatives in the same region before any provisioning attempt. "
+        "Supported backends: AWS, GCE.",
+    )
+    pre_flight_capacity_probe: Boolean = SctField(
+        description="Before provisioning, probe capacity by launching and terminating one on-demand instance per dynamic type "
+        "(`instance_type_db_target`, `nemesis_grow_shrink_instance_type`) in the chosen AZ. On capacity errors, raise to "
+        "trigger AZ/region fallback. Costs ~1 min per type. AWS-only.",
     )
     num_nodes_to_rollback: int = SctField(
         description="Number of nodes to upgrade and rollback in test_generic_cluster_upgrade",
@@ -2744,19 +2829,23 @@ class SCTConfiguration(BaseModel):
 
                 for region in oci_region_names:
                     try:
-                        oci_image = oci_utils.get_scylla_images(scylla_version, region)[0]
+                        if ":" in scylla_version:
+                            oci_image = oci_utils.get_scylla_images_by_branch(scylla_version, region)[0]
+                        else:
+                            oci_image = oci_utils.get_scylla_images_by_version(scylla_version, region)[0]
                     except Exception as ex:  # noqa: BLE001
                         raise ValueError(
                             f"Oracle Image for scylla_version='{scylla_version}' not found in {region}"
                         ) from ex
-                    self.log.debug(
+                    # NOTE: oci_image: ["OCI", <name>, <id>, ...]
+                    self.log.info(
                         "Found Oracle Image %s for scylla_version='%s' in %s",
-                        oci_image.display_name,
+                        oci_image[1],
                         scylla_version,
                         region,
                     )
                     scylla_oci_images.append(oci_image)
-                self["oci_image_db"] = " ".join(getattr(image, "id", None) for image in scylla_oci_images)
+                self["oci_image_db"] = " ".join(image[2] for image in scylla_oci_images)
             elif self.get("cluster_backend") == "xcloud" and ":" in scylla_version:
                 self._resolve_xcloud_version_tag(self.get("scylla_version"))
             elif not self.get("scylla_repo"):
@@ -2977,7 +3066,7 @@ class SCTConfiguration(BaseModel):
 
         # 16 Validate use_dns_names
         if self.get("use_dns_names"):
-            if cluster_backend not in ("aws",):
+            if cluster_backend and cluster_backend not in ("aws", "gce"):
                 raise ValueError(f"use_dns_names is not supported for {cluster_backend} backend")
 
         # 17 Validate scylla network configuration mandatory values
@@ -3189,7 +3278,10 @@ class SCTConfiguration(BaseModel):
             if field_env and any(key.startswith(field_env) for key in os.environ.keys()):
                 if field_env in os.environ.keys():
                     try:
-                        environment_vars[field_name] = from_env_func(os.environ[field_env])
+                        raw_value = os.environ[field_env]
+                        if isinstance(raw_value, str):
+                            raw_value = raw_value.strip()
+                        environment_vars[field_name] = from_env_func(raw_value)
                     except Exception as ex:  # noqa: BLE001
                         raise ValueError("failed to parse {} from environment variable".format(field_env)) from ex
                 nested_keys = [key for key in os.environ if key.startswith(field_env + ".")]
@@ -3198,10 +3290,13 @@ class SCTConfiguration(BaseModel):
                     dict_value = {}
                     for key in nested_keys:
                         nest_key, *_ = key.split(".")[1:]
+                        nested_value = os.environ.get(key)
+                        if isinstance(nested_value, str):
+                            nested_value = nested_value.strip()
                         if nest_key.isdigit():
-                            list_value.insert(int(nest_key), os.environ.get(key))
+                            list_value.insert(int(nest_key), nested_value)
                         else:
-                            dict_value[nest_key] = os.environ.get(key)
+                            dict_value[nest_key] = nested_value
                     current_value = environment_vars.get(field_name)
                     if current_value and isinstance(current_value, dict):
                         current_value.update(dict_value)
@@ -3302,6 +3397,8 @@ class SCTConfiguration(BaseModel):
                     if cmd.startswith("latte"):
                         script_name_regx = re.compile(r"([/\w-]*\.rn)")
                         script_name = script_name_regx.search(cmd).group(1)
+                        if script_name.startswith("scylla-qa-internal"):
+                            continue
                         full_path = pathlib.Path(get_sct_root_path()) / script_name
                         assert full_path.exists(), f"{full_path} doesn't exists, please check your configuration"
 
@@ -3671,6 +3768,8 @@ class SCTConfiguration(BaseModel):
     def _validate_scylla_d_overrides_files_exists(self):
         if scylla_d_overrides_files := self.get("scylla_d_overrides_files"):
             for config_file_path in scylla_d_overrides_files:
+                if config_file_path.startswith("scylla-qa-internal"):
+                    continue
                 config_file = pathlib.Path(get_sct_root_path()) / config_file_path
                 assert config_file.exists(), f"{config_file} doesn't exists, please check your configuration"
 
@@ -3687,7 +3786,7 @@ class SCTConfiguration(BaseModel):
                 self.backend_required_params["aws"].extend(
                     ["ami_id_vector_store", "instance_type_vector_store", "ami_vector_store_user"]
                 )
-                self._check_backend_defaults(backend, self.backend_required_params[backend])
+            self._check_backend_defaults(backend, self.backend_required_params[backend])
         else:
             raise ValueError("Unsupported backend [{}]".format(backend))
 
@@ -3711,9 +3810,11 @@ class SCTConfiguration(BaseModel):
                         )
                 case "gce":
                     machine_types_client, info = get_gce_compute_machine_types_client()
+                    regions_client, _ = get_gce_compute_regions_client()
                     for datacenter in self.gce_datacenters:
-                        for zone in GCE_SUPPORTED_REGIONS.get(datacenter):
-                            _zone = f"{datacenter}-{zone}"
+                        region_info = regions_client.get(project=info["project_id"], region=datacenter)
+                        zones = [z.rsplit("/", 1)[-1] for z in region_info.zones]
+                        for _zone in zones:
                             assert gce_check_if_machine_type_supported(
                                 machine_types_client, instance_type, project=info["project_id"], zone=_zone
                             ), f"Instance type[{instance_type}] not supported in zone [{_zone}]"

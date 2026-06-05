@@ -145,7 +145,8 @@ def test_12_scylla_version_repo_ubuntu(monkeypatch):
     monkeypatch.setenv("SCT_SCYLLA_LINUX_DISTRO_LOADER", "ubuntu-xenial")
     monkeypatch.setenv("SCT_SCYLLA_VERSION", "3.0.3")
     monkeypatch.setenv(
-        "SCT_GCE_IMAGE_DB", "https://www.googleapis.com/compute/v1/projects/centos-cloud/global/images/family/centos-7"
+        "SCT_GCE_IMAGE_DB",
+        "https://www.googleapis.com/compute/v1/projects/centos-cloud/global/images/family/centos-stream-9",
     )
     expected_repo = "https://s3.amazonaws.com/downloads.scylladb.com/deb/ubuntu/scylla-3.0-xenial.list"
     with (
@@ -164,7 +165,8 @@ def test_12_scylla_version_repo_ubuntu_loader_centos(monkeypatch):
     monkeypatch.setenv("SCT_SCYLLA_LINUX_DISTRO_LOADER", "centos")
     monkeypatch.setenv("SCT_SCYLLA_VERSION", "3.0.3")
     monkeypatch.setenv(
-        "SCT_GCE_IMAGE_DB", "https://www.googleapis.com/compute/v1/projects/centos-cloud/global/images/family/centos-7"
+        "SCT_GCE_IMAGE_DB",
+        "https://www.googleapis.com/compute/v1/projects/centos-cloud/global/images/family/centos-stream-9",
     )
     expected_repo = "https://s3.amazonaws.com/downloads.scylladb.com/deb/ubuntu/scylla-3.0-xenial.list"
     with (
@@ -354,7 +356,8 @@ def test_15_new_scylla_repo(monkeypatch):
     monkeypatch.setenv("SCT_NEW_SCYLLA_REPO", centos_repo)
     monkeypatch.setenv("SCT_USER_PREFIX", "testing")
     monkeypatch.setenv(
-        "SCT_GCE_IMAGE_DB", "https://www.googleapis.com/compute/v1/projects/centos-cloud/global/images/family/centos-7"
+        "SCT_GCE_IMAGE_DB",
+        "https://www.googleapis.com/compute/v1/projects/centos-cloud/global/images/family/centos-stream-9",
     )
 
     with unittest.mock.patch.object(sct_config, "get_branch_version", return_value="2019.1.1", clear=True):
@@ -370,7 +373,8 @@ def test_15a_new_scylla_repo_by_scylla_version(monkeypatch):
     monkeypatch.setenv("SCT_NEW_VERSION", "master:latest")
     monkeypatch.setenv("SCT_USER_PREFIX", "testing")
     monkeypatch.setenv(
-        "SCT_GCE_IMAGE_DB", "https://www.googleapis.com/compute/v1/projects/centos-cloud/global/images/family/centos-7"
+        "SCT_GCE_IMAGE_DB",
+        "https://www.googleapis.com/compute/v1/projects/centos-cloud/global/images/family/centos-stream-9",
     )
 
     resolved_repo_link = "https://s3.amazonaws.com/downloads.scylladb.com/unstable/scylla/master/rpm\
@@ -808,3 +812,18 @@ def test_migrator_source_hosts_and_test_id_mutually_exclusive(monkeypatch):
     conf = sct_config.SCTConfiguration()
     with pytest.raises(ValueError, match="mutually exclusive"):
         conf.verify_configuration()
+
+
+@pytest.mark.parametrize(
+    "raw_value,expected",
+    [
+        ("  2025.1.0  ", "2025.1.0"),
+        ("\t5.4.0\n", "5.4.0"),
+        ("2025.1.0", "2025.1.0"),
+    ],
+)
+def test_env_var_whitespace_is_stripped(monkeypatch, raw_value, expected):
+    """Environment variable values with leading/trailing whitespace are trimmed (SCT-340)."""
+    monkeypatch.setenv("SCT_SCYLLA_VERSION", raw_value)
+    conf = sct_config.SCTConfiguration()
+    assert conf.get("scylla_version") == expected

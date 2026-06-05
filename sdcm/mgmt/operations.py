@@ -6,6 +6,7 @@ from functools import cached_property
 from pathlib import Path
 from textwrap import dedent
 from time import sleep
+from typing import TYPE_CHECKING
 
 import boto3
 import yaml
@@ -16,6 +17,7 @@ from sdcm.mgmt.cli import ScyllaManagerTool
 from sdcm.mgmt.common import ObjectStorageUploadMode
 from sdcm import mgmt
 from sdcm.exceptions import FilesNotCorrupted
+from sdcm.keystore import KeyStore
 from sdcm.remote import shell_script_cmd, LOCALRUNNER
 from sdcm.sct_events.system import InfoEvent
 from sdcm.test_config import TestConfig
@@ -23,10 +25,13 @@ from sdcm.tester import ClusterTester
 from sdcm.utils.azure_utils import AzureService
 from sdcm.utils.cluster_tools import flush_nodes, major_compaction_nodes, clear_snapshot_nodes
 from sdcm.utils.compaction_ops import CompactionOps
-from sdcm.utils.gce_utils import get_gce_storage_client
+from sdcm.utils.gce_region import GceRegion
+from sdcm.utils.gce_utils import create_gce_storage_bucket, get_gce_storage_client, gce_override_object_retention
 from sdcm.utils.loader_utils import LoaderUtilsMixin
 from sdcm.utils.time_utils import ExecutionTimer
-from sdcm.utils.version_utils import ComparableScyllaVersion
+
+if TYPE_CHECKING:
+    from google.cloud.storage import Bucket
 
 
 class ClusterOperations(ClusterTester):
@@ -223,6 +228,30 @@ class BucketOperations(ClusterTester):
         else:
             raise ValueError(f"Unsupported cluster backend - {cluster_backend}, should be either aws or gce")
 
+    @staticmethod
+    def create_worm_bucket(region: str, bucket_name: str) -> "Bucket":
+        bucket = create_gce_storage_bucket(name=bucket_name, region=region, object_lock_enabled=True)
+
+        # Grant the access to this bucket for sct-manager-backup service account
+        project_id = KeyStore().get_gcp_credentials()["project_id"]
+        sa_email = f"{GceRegion.SCT_BACKUP_SERVICE_ACCOUNT}@{project_id}.iam.gserviceaccount.com"
+
+        policy = bucket.get_iam_policy(requested_policy_version=3)
+        policy.bindings.append({"role": "roles/storage.objectAdmin", "members": {f"serviceAccount:{sa_email}"}})
+        bucket.set_iam_policy(policy)
+
+        return bucket
+
+    @staticmethod
+    def destroy_worm_bucket(bucket: "Bucket") -> None:
+        gce_override_object_retention(bucket_name=bucket.name, path="")
+
+        blobs = list(bucket.list_blobs())
+        for blob in blobs:
+            blob.delete()
+
+        bucket.delete()
+
 
 @dataclass
 class SnapshotData:
@@ -253,6 +282,8 @@ class SnapshotData:
 
 
 class SnapshotOperations(ClusterTester):
+    BACKUP_FILE_PREFIXES = ("backup/sst", "backup/meta", "backup/schema")
+
     def _get_total_loaders(self) -> int:
         """Get total number of loaders, handling both single-DC (int) and multi-DC (space-separated string or list) formats."""
         n_loaders = self.params.get("n_loaders")
@@ -293,50 +324,70 @@ class SnapshotOperations(ClusterTester):
         return snapshot_data
 
     @staticmethod
-    def _get_all_snapshot_files_s3(cluster_id, bucket_name, region_name):
+    def _get_all_snapshot_files_s3(bucket_name: str, region_name: str, prefixes: list[str]) -> set[str]:
         file_set = set()
         s3_client = boto3.client("s3", region_name=region_name)
         paginator = s3_client.get_paginator("list_objects")
-        pages = paginator.paginate(Bucket=bucket_name, Prefix=f"backup/sst/cluster/{cluster_id}")
-        for page in pages:
-            # No Contents key means that no snapshot file of the cluster exist,
-            # probably no backup ran before this function
-            if "Contents" in page:
-                content_list = page["Contents"]
-                file_set.update([item["Key"] for item in content_list])
+        for prefix in prefixes:
+            pages = paginator.paginate(Bucket=bucket_name, Prefix=prefix)
+            for page in pages:
+                # No Contents key means that no snapshot file of the cluster exist,
+                # probably no backup ran before this function
+                if "Contents" in page:
+                    file_set.update(item["Key"] for item in page["Contents"])
         return file_set
 
     @staticmethod
-    def _get_all_snapshot_files_gce(cluster_id, bucket_name):
+    def _get_all_snapshot_files_gce(bucket_name: str, prefixes: list[str]) -> set[str]:
         file_set = set()
         storage_client, _ = get_gce_storage_client()
-        blobs = storage_client.list_blobs(bucket_or_name=bucket_name, prefix=f"backup/sst/cluster/{cluster_id}")
-        for listing_object in blobs:
-            file_set.add(listing_object.name)
+        for prefix in prefixes:
+            blobs = storage_client.list_blobs(bucket_or_name=bucket_name, prefix=prefix)
+            for listing_object in blobs:
+                file_set.add(listing_object.name)
         # Unlike S3, if no files match the prefix, no error will occur
         return file_set
 
     @staticmethod
-    def _get_all_snapshot_files_azure(cluster_id, bucket_name):
+    def _get_all_snapshot_files_azure(bucket_name: str, prefixes: list[str]) -> set[str]:
         file_set = set()
         azure_service = AzureService()
         container_client = azure_service.blob.get_container_client(container=bucket_name)
-        dir_listing = container_client.list_blobs(name_starts_with=f"backup/sst/cluster/{cluster_id}")
-        for listing_object in dir_listing:
-            file_set.add(listing_object.name)
+        for prefix in prefixes:
+            dir_listing = container_client.list_blobs(name_starts_with=prefix)
+            for listing_object in dir_listing:
+                file_set.add(listing_object.name)
         return file_set
 
-    def get_all_snapshot_files(self, cluster_id):
+    def get_all_snapshot_files(
+        self,
+        cluster_id: str,
+        bucket_location: str | None = None,
+        only_sstables: bool = True,
+    ) -> set[str]:
+        """Return backup object paths in the bucket for the given cluster.
+
+        Args:
+            cluster_id: Scylla Manager cluster ID.
+            bucket_location: Bucket name; falls back to `backup_bucket_location` param.
+            only_sstables: If True (default), collect only SSTable files (`backup/sst`).
+                           If False, collect all types: `backup/sst`, `backup/meta`, `backup/schema`.
+
+        Returns:
+            Set of object path strings found in the bucket.
+        """
         region_name = next(iter(self.params.region_names), "")
-        bucket_name = self.params.get("backup_bucket_location")[0].format(region=region_name)
+        bucket_name = bucket_location or self.params.get("backup_bucket_location")[0].format(region=region_name)
+
+        file_type_prefixes = ("backup/sst",) if only_sstables else self.BACKUP_FILE_PREFIXES
+        prefixes = [f"{p}/cluster/{cluster_id}" for p in file_type_prefixes]
+
         if self.params.get("backup_bucket_backend") == "s3":
-            return self._get_all_snapshot_files_s3(
-                cluster_id=cluster_id, bucket_name=bucket_name, region_name=region_name
-            )
+            return self._get_all_snapshot_files_s3(bucket_name=bucket_name, region_name=region_name, prefixes=prefixes)
         elif self.params.get("backup_bucket_backend") == "gcs":
-            return self._get_all_snapshot_files_gce(cluster_id=cluster_id, bucket_name=bucket_name)
+            return self._get_all_snapshot_files_gce(bucket_name=bucket_name, prefixes=prefixes)
         elif self.params.get("backup_bucket_backend") == "azure":
-            return self._get_all_snapshot_files_azure(cluster_id=cluster_id, bucket_name=bucket_name)
+            return self._get_all_snapshot_files_azure(bucket_name=bucket_name, prefixes=prefixes)
         else:
             raise ValueError(f'"{self.params.get("backup_bucket_backend")}" not supported')
 
@@ -488,9 +539,11 @@ class DatabaseOperations(ClusterTester):
             return base_id.replace("-", "")
         return base_id
 
-    def create_keyspace_and_basic_table(self, keyspace_name, table_name="example_table", replication_factor=1):
+    def create_keyspace_and_basic_table(
+        self, keyspace_name, table_name="example_table", replication_factor=1, tablets_config=None
+    ):
         self.log.info("creating keyspace {}".format(keyspace_name))
-        keyspace_existence = self.create_keyspace(keyspace_name, replication_factor)
+        keyspace_existence = self.create_keyspace(keyspace_name, replication_factor, tablets_config=tablets_config)
         assert keyspace_existence, "keyspace creation failed"
         # Keyspaces without tables won't appear in the repair, so the must have one
         self.log.info("creating the table {} in the keyspace {}".format(table_name, keyspace_name))
@@ -588,6 +641,38 @@ class DatabaseOperations(ClusterTester):
             target_node = self.db_cluster.nodes[2]
             self.delete_keyspace_directory(db_node=target_node, keyspace_name="keyspace1")
 
+    def get_ks_tables_map(self, keyspace_filter: list[str] | None = None) -> dict[str, list[str]]:
+        """Discover non-system keyspaces and their tables, excluding materialized views.
+
+        Args:
+            keyspace_filter: If provided, only include these keyspaces
+        """
+        ks_cf_list = self.db_cluster.get_non_system_ks_cf_list(
+            db_node=self.db_cluster.nodes[0],
+            filter_out_mv=True,
+            filter_by_keyspace=keyspace_filter,
+        )
+        ks_tables_map: dict[str, list[str]] = {}
+        for ks_cf in ks_cf_list:
+            ks, table = ks_cf.split(".", maxsplit=1)
+            ks_tables_map.setdefault(ks, []).append(table)
+        self.log.debug(f"ks_tables_map: {ks_tables_map}")
+        if not ks_tables_map:
+            raise ValueError("No non-system tables were found")
+        return ks_tables_map
+
+    def truncate_tables(self, ks_tables_map: dict[str, list[str]] | None = None) -> None:
+        """Truncate all tables in the given keyspace-tables map.
+
+        If ks_tables_map is not provided, it is fetched automatically via get_ks_tables_map().
+        """
+        if ks_tables_map is None:
+            ks_tables_map = self.get_ks_tables_map()
+        for ks, tables in ks_tables_map.items():
+            for table_name in tables:
+                self.log.info(f"Truncating {ks}.{table_name}")
+                self.db_cluster.nodes[0].run_cqlsh(f"TRUNCATE {ks}.{table_name}")
+
 
 class StressLoadOperations(ClusterTester, LoaderUtilsMixin):
     def _get_total_loaders(self) -> int:
@@ -647,16 +732,18 @@ class StressLoadOperations(ClusterTester, LoaderUtilsMixin):
         time.sleep(15)
         return stress_thread
 
-    def run_verification_read_stress(self, ks_names=None):
+    def run_verification_read_stress(self, ks_names: list[str] | None = None):
         stress_queue = []
         stress_cmd = self.params.get("stress_read_cmd")
-        keyspace_num = self.params.get("keyspace_num")
+
+        if ks_names is None:
+            ks_names = self.db_cluster.get_test_keyspaces()
+        assert ks_names, "No keyspaces provided for data verification"
+
         InfoEvent(message="Starting read stress for data verification").publish()
         stress_start_time = datetime.now()
-        if ks_names:
-            self.assemble_and_run_all_stress_cmd_by_ks_names(stress_queue, stress_cmd, ks_names)
-        else:
-            self.assemble_and_run_all_stress_cmd(stress_queue, stress_cmd, keyspace_num)
+        self.log.debug(f"Running read stress for keyspaces: {ks_names}")
+        self.assemble_and_run_all_stress_cmd_by_ks_names(stress_queue, stress_cmd, ks_names)
         for stress in stress_queue:
             self.verify_stress_thread(stress)
         stress_run_time = datetime.now() - stress_start_time
@@ -750,64 +837,19 @@ class ManagerTestFunctionsMixIn(
         else:
             return None
 
-    def verify_backup_success(
-        self,
-        mgr_cluster,
-        backup_task,
-        ks_names: list = None,
-        truncate=True,
-        restore_data_with_task=False,
-        timeout=None,
-    ):
-        snapshot_tag = backup_task.get_snapshot_tag()
-        ks_tables_map: dict[str, list[str]] = {}
-
-        ks_cf_list = self.db_cluster.get_non_system_ks_cf_list(
-            db_node=self.db_cluster.nodes[0],
-            filter_out_mv=True,
-            filter_by_keyspace=ks_names,
-        )
-        for ks_cf in ks_cf_list:
-            ks, table = ks_cf.split(".", maxsplit=1)
-            ks_tables_map.setdefault(ks, []).append(table)
-        self.log.debug(f"ks_tables_map: {ks_tables_map}")
-        if not ks_tables_map:
-            raise ValueError("No non-system tables were found for backup restore verification")
-
-        if truncate:
-            for ks, tables in ks_tables_map.items():
-                for table_name in tables:
-                    self.log.info(f"running truncate on {ks}.{table_name}")
-                    self.db_cluster.nodes[0].run_cqlsh(f"TRUNCATE {ks}.{table_name}")
-
-        if restore_data_with_task:
-            self.restore_backup_with_task(
-                mgr_cluster=mgr_cluster,
-                snapshot_tag=snapshot_tag,
-                timeout=timeout,
-                restore_data=True,
-            )
-            return
-
-        self.restore_backup_without_manager(
-            mgr_cluster=mgr_cluster,
-            snapshot_tag=snapshot_tag,
-            ks_tables_list=ks_tables_map,
-        )
-
     def verify_alternator_backup_success(self, mgr_cluster, backup_task, delete_tables: list = None, timeout=None):
         for table_name in delete_tables:
             self.log.info(f"running delete on {table_name}")
             self.alternator.delete_table(self.db_cluster.nodes[0], table_name=table_name, wait_until_table_removed=True)
-        self.restore_backup_with_task(
+        self.restore_with_manager_task(
             mgr_cluster=mgr_cluster, snapshot_tag=backup_task.get_snapshot_tag(), timeout=timeout, restore_schema=True
         )
-        self.restore_backup_with_task(
+        self.restore_with_manager_task(
             mgr_cluster=mgr_cluster, snapshot_tag=backup_task.get_snapshot_tag(), timeout=timeout, restore_data=True
         )
 
-    def restore_backup_without_manager(
-        self, mgr_cluster, snapshot_tag, ks_tables_list, location=None, precreated_backup=False
+    def restore_with_nodetool_refresh(
+        self, mgr_cluster, snapshot_tag, ks_tables_map, location=None, precreated_backup=False
     ):
         """Restore backup without Scylla Manager but using the `nodetool refresh` operation
         (https://opensource.docs.scylladb.com/stable/operating-scylla/nodetool-commands/refresh.html).
@@ -846,7 +888,7 @@ class ManagerTestFunctionsMixIn(
             # If the backup was not created with the cluster under test (precreated backup), get node_id from
             # sctool backup files output, otherwise, use node_ids of cluster under test
             backed_up_node_id = backed_up_node_ids[index] if precreated_backup else node.host_id
-            for keyspace, tables in ks_tables_list.items():
+            for keyspace, tables in ks_tables_map.items():
                 keyspace_path = node_data_path / keyspace
                 for table in tables:
                     table_id = self.get_table_id(node=node, table_name=table, keyspace_name=keyspace)
@@ -863,11 +905,20 @@ class ManagerTestFunctionsMixIn(
                         node.run_nodetool(f"refresh {keyspace} {table} {nodetool_refresh_extra_flags}")
                     self.log.info(f"[Node {index}][{keyspace}.{table}] Nodetool refresh took {timer.duration}")
 
-    def restore_backup_with_task(
+    def backup_with_manager_task(self, mgr_cluster, timeout=1500, **kwargs):
+        """Create a backup task, wait for completion, assert success, and return the task."""
+        location_list = kwargs.pop("location_list", self.locations)
+        method = kwargs.pop("method", self.backup_method)
+        backup_task = mgr_cluster.create_backup_task(location_list=location_list, method=method, **kwargs)
+        task_status = backup_task.wait_and_get_final_status(timeout=timeout)
+        assert task_status == TaskStatus.DONE, f"Backup task ended in {task_status} instead of {TaskStatus.DONE}"
+        return backup_task
+
+    def restore_with_manager_task(
         self,
         mgr_cluster,
         snapshot_tag,
-        timeout,
+        timeout=1500,
         restore_schema=False,
         restore_data=False,
         location_list=None,
@@ -890,10 +941,6 @@ class ManagerTestFunctionsMixIn(
         InfoEvent(
             message=f"The restore task has ended successfully. Restore run time: {restore_task.duration}."
         ).publish()
-
-        should_restart = restore_schema and ComparableScyllaVersion(self.db_cluster.nodes[0].scylla_version) <= "2024.1"
-        if should_restart:
-            self.db_cluster.restart_scylla()
 
         return restore_task
 

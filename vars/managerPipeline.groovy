@@ -64,7 +64,7 @@ def call(Map pipelineParams) {
                description: 'aws|gce',
                name: 'backend')
             string(defaultValue: "${pipelineParams.get('region', 'eu-west-1')}",
-               description: 'Supported: us-east-1 | eu-west-1 | eu-west-2 | eu-north-1 | eu-central-1 | us-west-2 | random (randomly select region)',
+               description: 'Supported: us-east-1 | us-east-2 | us-west-2 | eu-west-1 | eu-west-2 | eu-west-3 | eu-north-1 | eu-central-1 | ca-central-1 | random (randomly select region)',
                name: 'region')
             string(defaultValue: "${pipelineParams.get('gce_datacenter', 'us-east1')}",
                    description: 'GCE datacenter',
@@ -289,7 +289,7 @@ def call(Map pipelineParams) {
                         script {
                             wrap([$class: 'BuildUser']) {
                                 dir('scylla-cluster-tests') {
-                                    timeout(time: 30, unit: 'MINUTES') {
+                                    timeout(time: params.backend == 'azure' ? 60 : 30, unit: 'MINUTES') {
                                         if (params.backend == 'aws' || params.backend == 'azure' || params.backend == 'gce' || params.backend == 'oci') {
                                             provisionResources(params, builder.region)
                                         } else if (params.backend.contains('docker')) {
@@ -319,7 +319,7 @@ def call(Map pipelineParams) {
 
                                         // handle params which can be a json list
                                         def region = initAwsRegionParam(params.region, builder.region)
-                                        def datacenter = groovy.json.JsonOutput.toJson(params.gce_datacenter)
+                                        def datacenter = params.gce_datacenter ?: ""
                                         def oci_region = ""
                                         if (params.oci_region_name) {
                                             oci_region = initAwsRegionParam(params.oci_region_name, builder.region)
@@ -334,7 +334,7 @@ def call(Map pipelineParams) {
 
                                         export SCT_CLUSTER_BACKEND="${params.backend}"
                                         export SCT_REGION_NAME=${region}
-                                        export SCT_GCE_DATACENTER=${datacenter}
+                                        export SCT_GCE_DATACENTER='${datacenter}'
                                         if [[ -n "${params.azure_region_name ? params.azure_region_name : ''}" ]] ; then
                                             export SCT_AZURE_REGION_NAME=${params.azure_region_name}
                                         fi

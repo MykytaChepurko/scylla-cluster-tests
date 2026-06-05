@@ -11,6 +11,7 @@
 #
 # Copyright (c) 2020 ScyllaDB
 
+import json
 import os
 import time
 import logging
@@ -19,13 +20,15 @@ from functools import cached_property, cache
 from collections.abc import Callable
 
 import tenacity
+import yaml
 import google.api_core.exceptions
 from google.cloud import compute_v1
 
 from sdcm import cluster
 from sdcm.provision.gce.provisioner import GceProvisioner
-from sdcm.provision.network_configuration import ssh_connection_ip_type
-from sdcm.provision.provisioner import PricingModel
+from sdcm.provision.gce.instance_provider import _is_zone_exhausted
+from sdcm.provision.network_configuration import NetworkInterface, ScyllaNetworkConfiguration, ssh_connection_ip_type
+from sdcm.provision.provisioner import PricingModel, ProvisionError, ZoneResourcesExhaustedError
 from sdcm.provision.helpers.cloud_init import wait_cloud_init_completes
 from sdcm.sct_provision import region_definition_builder
 from sdcm.sct_provision.instances_provider import provision_instances_with_fallback
@@ -34,12 +37,14 @@ from sdcm.sct_events.gce_events import GceInstanceEvent
 from sdcm.utils.gce_utils import (
     GceLoggingClient,
     get_gce_compute_disks_client,
+    get_alternative_zones,
     wait_for_extended_operation,
     gce_private_addresses,
     gce_public_addresses,
     gce_set_labels,
 )
 from sdcm.wait import exponential_retry
+from sdcm.kernel_panic_checker import GCPKernelPanicChecker
 from sdcm.sct_events.system import SpotTerminationEvent
 from sdcm.utils.common import list_instances_gce, gce_meta_to_dict
 from sdcm.utils.decorators import retrying
@@ -108,12 +113,46 @@ class GCENode(cluster.BaseNode):
             after_config=after_config,
         )
 
+    @cached_property
+    def network_configuration(self):
+        """Query MAC→device name mapping from the node, same pattern as AWS."""
+        network_devices = {}
+        if self.remoter:
+            if network_config_json := self.remoter.run("ip -j link", ignore_status=True).stdout.strip():
+                interfaces = json.loads(network_config_json)
+                network_devices = {
+                    interface["address"]: interface["ifname"]
+                    for interface in interfaces
+                    if interface.get("ifname") != "lo" and interface.get("address")
+                }
+            if not network_devices:
+                ip_link_cmd = """ip -o link | awk '$2 != "lo:" {gsub(/:/,"",$2);print $17": " $2}'"""
+                network_config = self.remoter.run(ip_link_cmd).stdout.strip()
+                network_devices = yaml.safe_load(network_config)
+            self.log.debug("Node %s ethernets: %s", self.name, network_devices)
+        return network_devices
+
     def refresh_network_interfaces_info(self):
-        pass
+        if "network_configuration" in self.__dict__:
+            del self.__dict__["network_configuration"]
+        if self.scylla_network_configuration:
+            self.scylla_network_configuration.network_interfaces = self.network_interfaces
 
     @staticmethod
     def is_gce() -> bool:
         return True
+
+    @cached_property
+    def cql_address(self):
+        if self.scylla_network_configuration:
+            address = (
+                self.scylla_network_configuration.test_communication
+                if self.test_config.IP_SSH_CONNECTIONS == "public"
+                else self.scylla_network_configuration.broadcast_rpc_address
+            )
+            self.log.debug("cql_address is: %s", address)
+            return address
+        return super().cql_address
 
     @cluster.terminate_on_failure
     def init(self):
@@ -124,6 +163,29 @@ class GCENode(cluster.BaseNode):
         time.sleep(10)
 
         super().init()
+
+        if self.parent_cluster.params.get("scylla_network_config"):
+            self.scylla_network_configuration = ScyllaNetworkConfiguration(
+                network_interfaces=self.network_interfaces,
+                scylla_network_config=self.parent_cluster.params["scylla_network_config"],
+            )
+            self.log.debug(
+                "Node %s scylla_network_config: %s", self.name, self.parent_cluster.params["scylla_network_config"]
+            )
+            self.log.debug(
+                "Node %s network_interfaces: %s", self.name, self.scylla_network_configuration.network_interfaces
+            )
+            self.refresh_network_interfaces_info()
+
+    def _create_kernel_panic_checker(self):
+        return GCPKernelPanicChecker(
+            node_name=self.name,
+            instance_name=self._instance.name,
+            project=self.project,
+            zone=self.zone,
+            host=self.external_address,
+            logdir=self.logdir,
+        )
 
     def wait_for_cloud_init(self):
         self.remoter.is_up(timeout=300)
@@ -178,7 +240,28 @@ class GCENode(cluster.BaseNode):
 
     @property
     def network_interfaces(self):
-        pass
+        interfaces = []
+        devices = self.network_configuration if self.remoter else {}
+        device_names = list(devices.values()) if devices else []
+        for idx, iface in enumerate(self._instance.network_interfaces):
+            public_ip = None
+            if iface.access_configs:
+                public_ip = iface.access_configs[0].nat_i_p or None
+            interfaces.append(
+                NetworkInterface(
+                    ipv4_public_address=public_ip,
+                    ipv6_public_addresses=[],
+                    ipv4_private_addresses=[iface.network_i_p],
+                    ipv6_private_address="",
+                    dns_private_name=self.private_dns_name if self.remoter else "",
+                    dns_public_name=self.public_dns_name if self.remoter else "",
+                    device_index=idx,
+                    device_name=device_names[idx] if idx < len(device_names) else "",
+                    mac_address=None,
+                    use_dns_names=self.use_dns_names,
+                )
+            )
+        return interfaces
 
     @property
     def vm_region(self):
@@ -213,6 +296,8 @@ class GCENode(cluster.BaseNode):
                     case "compute.instances.preempted":
                         self.log.warning("Got spot termination notification from GCE")
                         SpotTerminationEvent(node=self, message="Instance was preempted.").publish()
+                    case "compute.instances.migrateOnHostMaintenance" | "compute.instances.terminateOnHostMaintenance":
+                        GceInstanceEvent(entry, severity=Severity.CRITICAL).publish()
                     case "compute.instances.automaticRestart" | "compute.instances.hostError":
                         GceInstanceEvent(entry).publish()
                     case _:
@@ -357,6 +442,16 @@ class GCECluster(cluster.BaseCluster):
                     identifier += "%s: %s | " % (disk_type, disk_size)
         return identifier
 
+    @property
+    def is_az_fallback_enabled(self) -> bool:
+        """Return True when AZ fallback on capacity errors is enabled.
+
+        Reads `fallback_to_next_availability_zone`.
+        """
+        if (value := self.params.get("fallback_to_next_availability_zone")) is not None:
+            return bool(value)
+        return False
+
     def _create_instances(self, count, dc_idx=0, instance_type=None):
         region = self._definition_builder.regions[dc_idx]
         pricing_model = PricingModel.SPOT if "spot" in self.instance_provision else PricingModel.ON_DEMAND
@@ -371,12 +466,77 @@ class GCECluster(cluster.BaseCluster):
                     instance_type=instance_type,
                 )
             )
-        return provision_instances_with_fallback(
-            self.provisioners[dc_idx],
-            definitions=definitions,
-            pricing_model=pricing_model,
-            fallback_on_demand=self.params.get("instance_provision_fallback_on_demand"),
-        )
+        try:
+            return provision_instances_with_fallback(
+                self.provisioners[dc_idx],
+                definitions=definitions,
+                pricing_model=pricing_model,
+                fallback_on_demand=self.params.get("instance_provision_fallback_on_demand"),
+            )
+        except (ZoneResourcesExhaustedError, ProvisionError) as exc:
+            if isinstance(exc, ProvisionError) and not _is_zone_exhausted(exc):
+                raise
+            if not self.is_az_fallback_enabled:
+                raise
+            if count > 1:
+                self.log.warning(
+                    "AZ fallback is only supported for single-node provisioning (count=%d), not retrying", count
+                )
+                raise
+            exhausted_zone = self.provisioners[dc_idx].availability_zone
+            self.log.warning("Zone %s exhausted, trying alternative zones in region %s", exhausted_zone, region)
+            machine_types = sorted({d.type for d in definitions if d.type})
+            alternative_zones = get_alternative_zones(region, exhausted_zone, machine_types=machine_types)
+            if not alternative_zones:
+                self.log.error(
+                    "No alternative zones found in region %s supporting machine types %s",
+                    region,
+                    machine_types,
+                )
+                raise
+            self.log.info(
+                "%s | %s: Attempting zone fallback; candidates: %s",
+                self,
+                self._gce_instance_type,
+                [f"{region}-{z}" for z in alternative_zones],
+            )
+            last_fallback_exc = None
+            for alt_zone in alternative_zones:
+                self.log.info("Attempting zone %s-%s as fallback", region, alt_zone)
+                try:
+                    new_provisioner = GceProvisioner(
+                        test_id=str(self.test_config.test_id()),
+                        region=region,
+                        availability_zone=alt_zone,
+                        network_name=self._gce_network,
+                    )
+                    result = provision_instances_with_fallback(
+                        new_provisioner,
+                        definitions=definitions,
+                        pricing_model=pricing_model,
+                        fallback_on_demand=self.params.get("instance_provision_fallback_on_demand"),
+                    )
+                    # Update provisioner and zone for this dc_idx on success
+                    self.provisioners[dc_idx] = new_provisioner
+                    self._gce_zone_names[dc_idx] = new_provisioner.availability_zone
+                    self.log.info("Successfully provisioned instances in fallback zone %s-%s", region, alt_zone)
+                    return result
+                except (ZoneResourcesExhaustedError, ProvisionError) as fallback_exc:
+                    last_fallback_exc = fallback_exc
+                    if isinstance(fallback_exc, ProvisionError) and not _is_zone_exhausted(fallback_exc):
+                        # Non-capacity error (auth/quota/misconfig) — don't retry other zones, re-raise immediately
+                        self.log.error(
+                            "Fallback zone %s-%s failed with non-capacity error: %s", region, alt_zone, fallback_exc
+                        )
+                        raise
+                    self.log.warning("Fallback zone %s-%s exhausted: %s, trying next", region, alt_zone, fallback_exc)
+                    continue
+            # All fallback zones were capacity-exhausted
+            cause = last_fallback_exc or exc
+            raise ZoneResourcesExhaustedError(
+                f"All zones in region {region} exhausted: tried {exhausted_zone} and "
+                f"{[f'{region}-{z}' for z in alternative_zones]}"
+            ) from cause
 
     def _destroy_instance(self, name: str, dc_idx: int):
         target_node = self._get_instances_by_name(dc_idx=dc_idx, name=name)

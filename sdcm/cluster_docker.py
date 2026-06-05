@@ -28,7 +28,6 @@ from sdcm.provision.helpers.certificate import (
 )
 from sdcm.remote import LOCALRUNNER
 from sdcm.remote.docker_cmd_runner import DockerCmdRunner
-from sdcm.reporting.tooling_reporter import VectorStoreVersionReporter
 from sdcm.sct_events.database import DatabaseLogEvent
 from sdcm.sct_events.filters import DbEventsFilter
 from sdcm.utils.docker_utils import get_docker_bridge_gateway, Container, ContainerManager, DockerException
@@ -308,6 +307,7 @@ class VectorStoreDockerNode(VectorStoreNodeMixin, DockerNode):
         base_logdir: Optional[str] = None,
         ssh_login_info: Optional[dict] = None,
         node_index: int = 1,
+        after_config=None,
     ) -> None:
         super().__init__(
             parent_cluster=parent_cluster,
@@ -316,6 +316,7 @@ class VectorStoreDockerNode(VectorStoreNodeMixin, DockerNode):
             base_logdir=base_logdir,
             ssh_login_info=ssh_login_info,
             node_index=node_index,
+            after_config=after_config,
         )
 
     def node_container_run_args(self, seed_ip=None):
@@ -596,7 +597,7 @@ class CassandraDockerCluster(BaseCassandraCluster, DockerCluster):
             params=params,
         )
 
-    def _create_node(self, node_index, container=None):
+    def _create_node(self, node_index, container=None, after_config=None):
         node = CassandraDockerNode(
             parent_cluster=self,
             container=container,
@@ -604,6 +605,7 @@ class CassandraDockerCluster(BaseCassandraCluster, DockerCluster):
             base_logdir=self.logdir,
             node_prefix=self.node_prefix,
             node_index=node_index,
+            after_config=after_config,
         )
 
         if container is None:
@@ -707,12 +709,6 @@ class VectorStoreSetDocker(VectorStoreClusterMixin, DockerCluster):
         if container is None:
             ContainerManager.run_container(node, "node")
             ContainerManager.wait_for_status(node, "node", status="running")
-        try:
-            VectorStoreVersionReporter(
-                node.remoter, "docker exec node /opt/vector-store/vector-store", self.test_config.argus_client()
-            ).report()
-        except Exception:  # noqa: BLE001
-            LOGGER.warning("Error submitting vector store version, VS package won't show in Argus.", exc_info=True)
         node.init()
         return node
 
@@ -725,6 +721,85 @@ class VectorStoreSetDocker(VectorStoreClusterMixin, DockerCluster):
         reuse_cluster = getattr(self.test_config, "REUSE_CLUSTER", "UNDEFINED")
         result = self._get_nodes() if reuse_cluster else self._create_nodes(count)
         return result
+
+
+class DockerLoaderNode(cluster.BaseNode):
+    """A lightweight loader node that runs locally on the host using LOCALRUNNER.
+
+    Instead of spinning up a Scylla container just to serve as a Docker host for
+    stress tool containers (docker-in-docker), this node runs directly on the host.
+    Stress tool containers (RemoteDocker) are launched directly via the local Docker daemon.
+    """
+
+    log = LOGGER
+
+    def __init__(
+        self,
+        parent_cluster: "LoaderSetDocker",
+        node_prefix: str = "loader-node",
+        base_logdir: Optional[str] = None,
+        node_index: int = 1,
+        ssh_login_info: Optional[dict] = None,
+        after_config=None,
+    ) -> None:
+        super().__init__(
+            name=f"{node_prefix}-{node_index}",
+            parent_cluster=parent_cluster,
+            base_logdir=base_logdir,
+            node_prefix=node_prefix,
+            ssh_login_info=ssh_login_info,
+            after_config=after_config,
+        )
+        self.node_index = node_index
+
+    def wait_for_cloud_init(self):
+        pass
+
+    def wait_ssh_up(self, verbose=True, timeout=500):
+        pass
+
+    @staticmethod
+    def is_docker() -> bool:
+        return False
+
+    @cached_property
+    def tags(self) -> dict[str, str]:
+        return {
+            **super().tags,
+            "NodeIndex": str(self.node_index),
+        }
+
+    def _init_remoter(self, ssh_login_info):
+        self.remoter = LOCALRUNNER
+
+    def _init_port_mapping(self):
+        pass
+
+    def update_repo_cache(self):
+        pass
+
+    def _refresh_instance_state(self):
+        return ["127.0.0.1"], ["127.0.0.1"]
+
+    def refresh_ip_address(self):
+        pass
+
+    def start_journal_thread(self):
+        pass
+
+    def disable_daily_triggered_services(self):
+        pass
+
+    def _set_keep_duration(self, duration_in_hours: int) -> None:
+        pass
+
+    @property
+    def vm_region(self):
+        return "docker"
+
+    @property
+    def region(self):
+        return "docker"
 
 
 class LoaderSetDocker(cluster.BaseLoaderSet, DockerCluster):
@@ -743,9 +818,6 @@ class LoaderSetDocker(cluster.BaseLoaderSet, DockerCluster):
         cluster.BaseLoaderSet.__init__(self, params=params)
         DockerCluster.__init__(
             self,
-            docker_image=docker_image,
-            docker_image_tag=docker_image_tag,
-            node_key_file=node_key_file,
             cluster_prefix=cluster_prefix,
             node_prefix=node_prefix,
             node_type="loader",
@@ -753,19 +825,35 @@ class LoaderSetDocker(cluster.BaseLoaderSet, DockerCluster):
             params=params,
         )
 
-    def node_setup(self, node: DockerNode, verbose=False, **kwargs):
-        node.remoter.sudo("apt update", verbose=True, ignore_status=True)
-        node.remoter.sudo("apt install -y openjdk-8-jre", verbose=True, ignore_status=True)
-        node.remoter.sudo(
-            "ln -sf /usr/lib/jvm/java-1.8.0-openjdk-amd64/jre/bin/java* /etc/alternatives/java",
-            verbose=True,
-            ignore_status=True,
+    def _create_node(self, node_index, container=None, after_config=None):
+        node = DockerLoaderNode(
+            parent_cluster=self,
+            base_logdir=self.logdir,
+            node_prefix=self.node_prefix,
+            node_index=node_index,
+            ssh_login_info=None,
         )
+        node.init()
+        return node
 
-        self._install_docker_cli(node, verbose=verbose)
+    def add_nodes(
+        self,
+        count,
+        ec2_user_data="",
+        dc_idx=0,
+        rack=0,
+        enable_auto_bootstrap=False,
+        instance_type=None,
+        after_config=None,
+    ):
+        assert instance_type is None, "docker can provision different instance types"
+        return self._create_nodes(count, enable_auto_bootstrap)
+
+    def node_setup(self, node: DockerLoaderNode, verbose=False, timeout=3600, **kwargs):
+        # No container setup needed - stress tools run directly on the host via LOCALRUNNER.
+        # Docker is already available on the host machine.
         if self.params.get("client_encrypt"):
             self._generate_loader_certs(node)
-            node.config_client_encrypt()
 
     def _generate_loader_certs(self, node):
         """Generate SSL client certificates for a Docker loader node."""
@@ -780,42 +868,6 @@ class LoaderSetDocker(cluster.BaseLoaderSet, DockerCluster):
             node.ssl_conf_dir / TLSAssets.PKCS12_KEYSTORE,
         )
 
-    def _install_docker_cli(self, node, verbose=False):
-        result = node.remoter.run("docker --version", ignore_status=True, verbose=False)
-        if result.ok:
-            self.log.debug("Docker CLI already installed on loader node: %s", result.stdout.strip())
-            return
-
-        self.log.debug("Installing Docker CLI on loader node")
-
-        commands = (
-            [
-                "apt update",
-                "apt install -y gnupg2 software-properties-common lsb-release",
-                "curl -fsSL https://download.docker.com/linux/ubuntu/gpg | apt-key add -",
-                'add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable"',
-                "apt update",
-                "apt install -y docker-ce-cli",
-            ]
-            if node.distro.is_debian_like
-            else [
-                "curl -L https://download.docker.com/linux/centos/docker-ce.repo -o /etc/yum.repos.d/docker-ce.repo",
-                "microdnf -y update",
-                "microdnf -y install docker-ce-cli",
-            ]
-        )
-
-        for cmd in commands:
-            result = node.remoter.run(cmd, timeout=300, verbose=verbose, ignore_status=True, retry=3, user="root")
-            if not result.ok:
-                raise RuntimeError(f"Command {cmd} failed with error: {result.stderr.strip()}")
-
-        verify = node.remoter.run("docker --version", ignore_status=True)
-        if verify.ok:
-            self.log.info("Docker CLI installed successfully: %s", verify.stdout.strip())
-        else:
-            raise RuntimeError("Docker CLI installation verification failed")
-
 
 class DockerMonitoringNode(cluster.BaseNode):
     log = LOGGER
@@ -827,6 +879,7 @@ class DockerMonitoringNode(cluster.BaseNode):
         base_logdir: Optional[str] = None,
         node_index: int = 1,
         ssh_login_info: Optional[dict] = None,
+        after_config=None,
     ) -> None:
         super().__init__(
             name=f"{node_prefix}-{node_index}",
@@ -834,6 +887,7 @@ class DockerMonitoringNode(cluster.BaseNode):
             base_logdir=base_logdir,
             node_prefix=node_prefix,
             ssh_login_info=ssh_login_info,
+            after_config=after_config,
         )
         self.node_index = node_index
 

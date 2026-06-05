@@ -425,6 +425,7 @@ def list_logs_by_test_id(test_id):
         "corrupted-sstables",
         "sstables",
         "builder",
+        "system_compaction_history",
     ]
 
     results = []
@@ -2607,7 +2608,7 @@ def shorten_cluster_name(name: str, max_string_len: int):
         shorten name - lon-scy-ope-3h-gke-je-k8s-gke-cd86ad2b
     """
     max_alpha_chunk_size = _string_max_chunk_size(name)
-    last_chunk = name.split("-")[-1]
+    last_chunk = name.rsplit("-", maxsplit=1)[-1]
     current = "-".join(name.split("-")[0:-1])
     last_chunk_len = len(last_chunk)
     while len(current) + last_chunk_len + 1 > max_string_len and max_alpha_chunk_size > 0:
@@ -3028,7 +3029,7 @@ def download_and_unpack_logs(test_id: str, log_type: str, download_to: str = Non
         raise ValueError("%s not found in argus logs", log_type)
 
     LOGGER.debug("Unpacking loader logs...")
-    from sdcm.monitorstack import extract_file_from_tar_archive  # noqa: PLC0415 # avoid circular import
+    from sdcm.monitorstack.restore import extract_file_from_tar_archive  # noqa: PLC0415 - circular: restore.py imports from utils.common
 
     hdr_folder = extract_file_from_tar_archive(pattern=log_type, archive=logs_file, extract_dir=tmp_dir)
     LOGGER.debug("%s logs unpacked to %s", log_type, hdr_folder[test_id])

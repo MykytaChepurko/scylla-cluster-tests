@@ -88,6 +88,7 @@
 - SlaReplaceUsingDropDuringLoad
 - SnapshotOperations
 - SoftRebootNodeMonkey
+- SplitMergeTabletsWithAlter
 - SslHotReloadingNemesis
 - StartStopCleanupCompaction
 - StartStopMajorCompaction
@@ -101,6 +102,7 @@
 - TerminateKubernetesHostThenDecommissionAndAddScyllaNode
 - TerminateKubernetesHostThenReplaceScyllaNode
 - ToggleAuditNemesisSyslog
+- ToggleAuditRulesNemesisSyslog
 - ToggleCDCMonkey
 - ToggleGcModeMonkey
 - ToggleLdapConfiguration

@@ -19,7 +19,6 @@ from sdcm.cluster import TestConfig
 from sdcm.sct_events import Severity
 from sdcm.sct_events.database import DatabaseLogEvent
 from sdcm.sct_events.filters import DbEventsFilter, EventsSeverityChangerFilter, EventsFilter
-from sdcm.sct_events.gce_events import GceInstanceEvent
 from sdcm.sct_events.loaders import YcsbStressEvent
 from sdcm.sct_events.monitors import PrometheusAlertManagerEvent
 from sdcm.utils.issues import SkipPerIssues
@@ -298,6 +297,20 @@ def ignore_compaction_stopped_exceptions():
 
 
 @contextmanager
+def ignore_ignore_runtime_errors():
+    # These are actually INFO logs, but they get caught by RUNTIME_ERROR filter
+    with ExitStack() as stack:
+        stack.enter_context(
+            EventsSeverityChangerFilter(
+                new_severity=Severity.NORMAL,
+                event_class=DatabaseLogEvent,
+                regex=r".*ignoring error response: std::runtime_error.*",
+            )
+        )
+        yield
+
+
+@contextmanager
 def ignore_large_collection_warning():
     with ExitStack() as stack:
         stack.enter_context(DbEventsFilter(db_event=DatabaseLogEvent.WARNING, line="Writing large collection"))
@@ -558,18 +571,6 @@ def ignore_take_snapshot_failing():
 
 
 @contextmanager
-def critical_host_maintenance_migration(extra_time_to_expiration: int = 360):
-    """Escalate GCE host-maintenance migration events to CRITICAL for the duration of the block."""
-    with EventsSeverityChangerFilter(
-        new_severity=Severity.CRITICAL,
-        event_class=GceInstanceEvent,
-        regex=r".*migrateOnHostMaintenance.*",
-        extra_time_to_expiration=extra_time_to_expiration,
-    ):
-        yield
-
-
-@contextmanager
 def ignore_ipv6_failure_to_assign():
     with ExitStack() as stack:
         stack.enter_context(
@@ -591,12 +592,28 @@ def ignore_ipv6_failure_to_assign():
         yield
 
 
+@contextmanager
+def ignore_hints_sending_errors():
+    with ExitStack() as stack:
+        stack.enter_context(
+            EventsSeverityChangerFilter(
+                new_severity=Severity.WARNING,
+                event_class=DatabaseLogEvent,
+                regex=r".*hints_manager - hint_sender.*send_one_file: Segment error.*Segment data corruption.*",
+                extra_time_to_expiration=30,
+            )
+        )
+        yield
+
+
 NODE_UNAVAILABLE_CONTEXTS: list[Callable[[], ContextManager]] = [
     ignore_raft_topology_cmd_failing,
     ignore_raft_transport_failing,
     ignore_ycsb_connection_refused,
     ignore_stream_mutation_fragments_errors,
     ignore_compaction_stopped_exceptions,
+    ignore_ignore_runtime_errors,
+    ignore_hints_sending_errors,
 ]
 
 
@@ -693,3 +710,22 @@ def decorate_with_context_if_issues_open(
         return wrapper
 
     return decorator
+
+
+@contextmanager
+def ignore_audit_errors():
+    """Suppress audit unavailable_exception errors by lowering their severity to WARNING.
+
+    After network disruptions (e.g. interface down/up, node restart), there is a brief
+    period where a node may fail to write to the audit table because it still considers
+    other nodes as down. This is expected behavior and should not fail the test.
+
+    See: https://scylladb.atlassian.net/browse/SCYLLADB-706
+    """
+    with EventsSeverityChangerFilter(
+        new_severity=Severity.WARNING,
+        event_class=DatabaseLogEvent,
+        regex=r".*audit - Unexpected exception when writing.*unavailable_exception.*",
+        extra_time_to_expiration=30,
+    ):
+        yield

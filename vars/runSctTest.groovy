@@ -3,10 +3,7 @@
 def call(Map params, String region, functional_test = false, Map pipelineParams = [:]){
     // handle params which can be a json list
     def current_region = initAwsRegionParam(params.region, region)
-    def current_gce_datacenter = ""
-    if (params.gce_datacenter) {
-        current_gce_datacenter = groovy.json.JsonOutput.toJson(params.gce_datacenter)
-    }
+    def current_gce_datacenter = params.gce_datacenter ?: ""
     def current_oci_region = ""
     if (params.oci_region_name) {
         current_oci_region = initAwsRegionParam(params.oci_region_name, region)
@@ -65,7 +62,7 @@ def call(Map params, String region, functional_test = false, Map pipelineParams 
     fi
 
     if [[ -n "${params.gce_datacenter ? params.gce_datacenter : ''}" ]] ; then
-        export SCT_GCE_DATACENTER=${current_gce_datacenter}
+        export SCT_GCE_DATACENTER='${current_gce_datacenter}'
     fi
 
     if [[ -n "${params.azure_region_name ? params.azure_region_name : ''}" ]] ; then
@@ -140,6 +137,9 @@ def call(Map params, String region, functional_test = false, Map pipelineParams 
     if [[ -n "${params.oci_image_db ? params.oci_image_db : ''}" ]] ; then
         export SCT_OCI_IMAGE_DB="${params.oci_image_db}"
     fi
+    if [[ -n "${params.oci_instance_type_db ? params.oci_instance_type_db : ''}" ]] ; then
+        export SCT_OCI_INSTANCE_TYPE_DB="${params.oci_instance_type_db}"
+    fi
     if [[ -n "${params.scylla_version ? params.scylla_version : ''}" ]] ; then
         export SCT_SCYLLA_VERSION="${params.scylla_version}"
     fi
@@ -178,6 +178,9 @@ def call(Map params, String region, functional_test = false, Map pipelineParams 
     fi
     if [[ -n "${params.post_behavior_vector_store_nodes ? params.post_behavior_vector_store_nodes : ''}" ]] ; then
         export SCT_POST_BEHAVIOR_VECTOR_STORE_NODES="${params.post_behavior_vector_store_nodes}"
+    fi
+    if [[ -n "${params.n_vector_store_nodes ? params.n_vector_store_nodes : ''}" ]] ; then
+        export SCT_N_VECTOR_STORE_NODES="${params.n_vector_store_nodes}"
     fi
 
     if [[ -n "${params.provision_type ? params.provision_type : ''}" ]] ; then

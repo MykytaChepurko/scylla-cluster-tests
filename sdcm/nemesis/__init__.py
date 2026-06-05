@@ -84,6 +84,7 @@ from sdcm.sct_events.decorators import raise_event_on_failure
 from sdcm.sct_events.filters import DbEventsFilter, EventsSeverityChangerFilter
 from sdcm.sct_events.group_common_events import (
     ignore_alternator_client_errors,
+    ignore_audit_errors,
     ignore_no_space_errors,
     ignore_scrub_invalid_errors,
     decorate_with_context,
@@ -805,7 +806,7 @@ class NemesisRunner:
         time.sleep(60)
 
     def disrupt_hard_reboot_node(self):
-        with ignore_raft_topology_cmd_failing():
+        with suppress_expected_unavailability_errors():
             self.reboot_node(target_node=self.target_node, hard=True)
         with self.action_log_scope(f"Wait for {self.target_node.name} node to be fully started"):
             self.target_node.wait_node_fully_start()
@@ -1285,6 +1286,8 @@ class NemesisRunner:
             new_nodes = skip_on_capacity_issues(db_cluster=self.tester.db_cluster)(self.cluster.add_nodes)(
                 **add_node_func_args
             )
+        if not new_nodes:
+            raise NodeSetupFailed(f"Failed to add {count} new node(s): add_nodes returned {new_nodes!r}")
         self.monitoring_set.reconfigure_scylla_monitoring()
         nodes_names = ",".join([new_node.name for new_node in new_nodes])
         try:
@@ -1317,8 +1320,11 @@ class NemesisRunner:
             self.set_target_node(allow_only_last_node_in_rack=True)
 
         target_is_seed = self.target_node.is_seed
-        with self.action_log_scope(
-            f"Decommission {self.target_node.name} node. is_zero_token_node: {self.target_node._is_zero_token_node}"
+        with (
+            suppress_expected_unavailability_errors(),
+            self.action_log_scope(
+                f"Decommission {self.target_node.name} node. is_zero_token_node: {self.target_node._is_zero_token_node}"
+            ),
         ):
             dc_topology_rf_change = self.cluster.decommission(self.target_node)
         new_node = None
@@ -4035,16 +4041,17 @@ class NemesisRunner:
         wait_time = self.random.choice(list_of_timeout_options)
         self.log.debug("Taking down eth1 for %dsec", wait_time)
 
-        try:
-            self.target_node.stop_network_interface()
-            self.actions_log.info(f"Taking {self.target_node.name} node network interface down")
-            time.sleep(wait_time)
-        finally:
-            self.actions_log.info(f"Brigning {self.target_node.name} node network interface up")
-            self.target_node.start_network_interface()
-            with self.action_log_scope("Wait all nodes up and normal"):
-                self.cluster.wait_all_nodes_un()
-        self.actions_log.info(f"Network interface down/up finished on {self.target_node.name} node")
+        with ignore_audit_errors():
+            try:
+                self.target_node.stop_network_interface()
+                self.actions_log.info(f"Taking {self.target_node.name} node network interface down")
+                time.sleep(wait_time)
+            finally:
+                self.actions_log.info(f"Brigning {self.target_node.name} node network interface up")
+                self.target_node.start_network_interface()
+                with self.action_log_scope("Wait all nodes up and normal"):
+                    self.cluster.wait_all_nodes_un()
+            self.actions_log.info(f"Network interface down/up finished on {self.target_node.name} node")
 
     def _call_disrupt_func_after_expression_logged(
         self,
@@ -4364,9 +4371,12 @@ class NemesisRunner:
     @latency_calculator_decorator(legend="Doubling cluster load")
     def _double_cluster_load(self, duration: int) -> None:
         duration = 30
+        stress_cmd = self.tester.stress_cmd
+        if isinstance(stress_cmd, list):
+            stress_cmd = stress_cmd[0]
         self.log.info("Doubling the load on the cluster for %s minutes", duration)
         stress_queue = self.tester.run_stress_thread(
-            stress_cmd=self.tester.stress_cmd, stress_num=1, stats_aggregate_cmds=False, duration=duration
+            stress_cmd=stress_cmd, stress_num=1, stats_aggregate_cmds=False, duration=duration
         )
         results = self.tester.verify_stress_thread(
             thread_pool=stress_queue, error_handler=self._nemesis_stress_failure_handler
@@ -5398,7 +5408,14 @@ class NemesisRunner:
     def disrupt_toggle_audit_syslog(self):
         self._disrupt_toggle_audit(store="syslog")
 
-    def _disrupt_toggle_audit(self, store: "AuditStore"):
+    def disrupt_toggle_audit_rules_syslog(self):
+        with self.target_node.remote_scylla_yaml() as scylla_yaml:
+            configured_audit = scylla_yaml.audit or "none"
+        if configured_audit != "none":
+            raise UnsupportedNemesis("ToggleAuditRulesNemesisSyslog requires audit to be initially disabled")
+        self._disrupt_toggle_audit(store="syslog", use_audit_rules=True)
+
+    def _disrupt_toggle_audit(self, store: "AuditStore", use_audit_rules: bool = False):  # noqa: PLR0914
         """
         Enable audit log with all categories and user keyspaces (if audit already enabled, disable it and finish the Nemesis),
         verify audit log content,
@@ -5415,6 +5432,10 @@ class NemesisRunner:
             raise UnsupportedNemesis(
                 "Audit feature log format was changed in Scylla 2025.2 and later. Use old sct-branch for Scylla < 2025.2"
             )
+        if use_audit_rules and (
+            ComparableScyllaVersion(self.target_node.scylla_version) < ComparableScyllaVersion("2026.2.0-dev")
+        ):
+            raise UnsupportedNemesis("audit_rules are supported by Scylla 2026.2.0-dev and later")
 
         audit = Audit(self.cluster)
 
@@ -5425,19 +5446,34 @@ class NemesisRunner:
 
         audit_keyspace = "audit_keyspace"
         keyspaces_for_audit = [audit_keyspace]
-        InfoEvent(f"Enabling full audit for keyspaces: {keyspaces_for_audit}").publish()
+        audit_categories = ["DCL", "DDL", "AUTH", "ADMIN", "DML", "QUERY"]
+        audit_rules = None
+        if use_audit_rules:
+            audit_rules = [
+                {
+                    "sinks": [store],
+                    "categories": audit_categories,
+                    "qualified_table_names": [f"{audit_keyspace}.*"],
+                    "roles": ["*"],
+                }
+            ]
+            audit_categories = []
+            keyspaces_for_audit = []
+        InfoEvent(f"Enabling full audit for keyspaces: {[audit_keyspace]}").publish()
         audit_config = AuditConfiguration(
             store=store,
-            categories=["DCL", "DDL", "AUTH", "ADMIN", "DML", "QUERY"],
+            categories=audit_categories,
             keyspaces=keyspaces_for_audit,
             tables=[],
+            rules=audit_rules,
         )
         try:
             with self.action_log_scope(
-                f"Enable {store} audit on categories: {audit_config.categories} in {keyspaces_for_audit} keyspace"
+                f"Enable {store} audit on categories: {audit_config.categories or audit_rules} "
+                f"in {[audit_keyspace]} keyspace"
             ):
                 audit.configure(audit_config)
-            keyspace_name = keyspaces_for_audit[0]
+            keyspace_name = audit_keyspace
             errors = []
             audit_start = datetime.datetime.now() - datetime.timedelta(seconds=5)
             InfoEvent(message="Writing/Reading data from audited keyspace").publish()
@@ -5478,15 +5514,23 @@ class NemesisRunner:
                     LOGGER.error("QUERY audit log row: %s", row)
         except Exception as ex:
             LOGGER.error("Exception while testing full audit: %s", ex)
-            audit_config.categories = ["DCL", "DDL", "AUTH", "ADMIN"]
-            with self.action_log_scope(f"Reconfiguring audit with {audit_config.categories} categories"):
+            reduced_audit_categories = ["DCL", "DDL", "AUTH", "ADMIN"]
+            if use_audit_rules:
+                audit_config.rules[0]["categories"] = reduced_audit_categories
+            else:
+                audit_config.categories = reduced_audit_categories
+            with self.action_log_scope(f"Reconfiguring audit with {reduced_audit_categories} categories"):
                 audit.configure(audit_config)
             raise
 
         InfoEvent("Reducing audit categories and setting back audited keyspaces").publish()
 
-        audit_config.categories = ["DCL", "DDL", "AUTH", "ADMIN"]
-        with self.action_log_scope(f"Reconfiguring audit with {audit_config.categories} categories"):
+        reduced_audit_categories = ["DCL", "DDL", "AUTH", "ADMIN"]
+        if use_audit_rules:
+            audit_config.rules[0]["categories"] = reduced_audit_categories
+        else:
+            audit_config.categories = reduced_audit_categories
+        with self.action_log_scope(f"Reconfiguring audit with {reduced_audit_categories} categories"):
             audit.configure(audit_config)
         table_name = "audit_cf"
         audit_start = datetime.datetime.now() - datetime.timedelta(seconds=5)
@@ -5580,7 +5624,10 @@ class NemesisRunner:
                     self.cluster.decommission(new_node, timeout=decommission_timeout)
 
     def disrupt_disable_binary_gossip_execute_major_compaction(self):
-        with nodetool_context(node=self.target_node, start_command="disablebinary", end_command="enablebinary"):
+        with (
+            suppress_expected_unavailability_errors(),
+            nodetool_context(node=self.target_node, start_command="disablebinary", end_command="enablebinary"),
+        ):
             self.actions_log.info("Executed nodetool disablebinary")
             self.target_node.run_nodetool("statusbinary")
             self.target_node.run_nodetool("status")
@@ -5790,6 +5837,7 @@ class NemesisRunner:
 
             assert not is_scylla_running(self.target_node)
 
+    @decorate_with_context(suppress_expected_unavailability_errors)
     def disrupt_kill_mv_building_coordinator(self):
         """
         MV building coordinator is responsible for building MV from base table in
@@ -5846,21 +5894,20 @@ class NemesisRunner:
             try:
                 num_of_restarts = len(self.cluster.nodes) // 2
                 self.log.debug("Number of serial restart of topology coordinator: %s", num_of_restarts)
-                with suppress_expected_unavailability_errors():
-                    for i in range(num_of_restarts):
-                        self.log.debug("Kill coordinator node: %s round: %s", self.target_node.name, i + 1)
-                        self._kill_scylla_daemon()
-                        coordinator_node = get_topology_coordinator_node(working_node)
-                        self.log.debug("New coordinator node %s", coordinator_node.name)
-                        try:
-                            self.switch_target_node(coordinator_node)
-                        except NemesisNodeAllocationError:
-                            self.log.debug(
-                                "Coordinator node is busy with %s, number of coordinator successful restarts: %s",
-                                coordinator_node.running_nemesis,
-                                i,
-                            )
-                            break
+                for i in range(num_of_restarts):
+                    self.log.debug("Kill coordinator node: %s round: %s", self.target_node.name, i + 1)
+                    self._kill_scylla_daemon()
+                    coordinator_node = get_topology_coordinator_node(working_node)
+                    self.log.debug("New coordinator node %s", coordinator_node.name)
+                    try:
+                        self.switch_target_node(coordinator_node)
+                    except NemesisNodeAllocationError:
+                        self.log.debug(
+                            "Coordinator node is busy with %s, number of coordinator successful restarts: %s",
+                            coordinator_node.running_nemesis,
+                            i,
+                        )
+                        break
 
                 with adaptive_timeout(operation=Operations.CREATE_MV, node=working_node, timeout=14400) as timeout:
                     wait_for_view_to_be_built(working_node, ks_name, view_name, timeout=timeout * 2)
@@ -5873,6 +5920,76 @@ class NemesisRunner:
             finally:
                 with self.cluster.cql_connection_patient(node=working_node, connect_timeout=600) as session:
                     drop_materialized_view(session, ks_name, view_name)
+
+    def disrupt_trigger_split_merge_tablets_with_alter(self):
+        """
+        Trigger split and merge tablets on target node while altering table with tablets enabled.
+        Verifies that after the alter operation is complete, the tablets are in a healthy state.
+
+        Uses ALTER TABLE/VIEW ... WITH tablets = {'min_tablet_count': N} to trigger split/merge.
+        This is the recommended approach per the ScyllaDB tablets team.
+        The min_tablet_count is a hint; actual split/merge depends on data size and shard limits.
+
+        The tablet count is intentionally not restored to the original value after the nemesis:
+        - This operation is non-disruptive (schema change only)
+        - Scylla will naturally adjust tablet counts based on data size conditions
+        - Subsequent nemesis runs will alternate between split (count=256) and merge (count=2)
+        """
+        if not is_tablets_feature_enabled(self.target_node):
+            raise UnsupportedNemesis("Tablets feature is not enabled on target node")
+
+        with self.cluster.cql_connection_patient(node=self.target_node, connect_timeout=600) as session:
+            ks_cfs_mvs = self.cluster.get_non_system_ks_cf_with_tablets_list(
+                db_node=self.target_node,
+                filter_empty_tables=False,
+                filter_out_table_with_counter=True,
+                filter_out_mv=False,
+            )
+            ks_cfs = self.cluster.get_non_system_ks_cf_with_tablets_list(
+                db_node=self.target_node,
+                filter_empty_tables=False,
+                filter_out_table_with_counter=True,
+                filter_out_mv=True,
+            )
+            mvs = set(ks_cfs_mvs) - set(ks_cfs)
+            ks_cfs = [(ks_cf, False) for ks_cf in ks_cfs] + [(ks_mv, True) for ks_mv in mvs]
+            if not ks_cfs:
+                raise UnsupportedNemesis(
+                    "Non-system keyspaces with enabled tablets are not found. nemesis can't be run"
+                )
+            log_followers = {}
+            cql_query = "ALTER {table} {ks_name}.{table_name} WITH tablets = {{'min_tablet_count': {count}, 'expected_data_size_in_gb': 100}}"
+
+            for ks_cf, is_mv in ks_cfs:
+                ks_name, table_name = ks_cf.split(".")
+                cql = f"SELECT count(*) from system.tablets where table_name = '{table_name}' ALLOW FILTERING"
+                result = session.execute(cql)
+                tablet_count = result.one().count
+                if tablet_count < 16:
+                    cql = cql_query.format(
+                        table="MATERIALIZED VIEW" if is_mv else "TABLE",
+                        ks_name=ks_name,
+                        table_name=table_name,
+                        count=256,
+                    )
+                    reg_exp = "Detected tablet split"
+                else:
+                    cql = cql_query.format(
+                        table="MATERIALIZED VIEW" if is_mv else "TABLE", ks_name=ks_name, table_name=table_name, count=2
+                    )
+                    reg_exp = "Detected tablet merge"
+                log_followers.update(
+                    {(ks_name, table_name, reg_exp): self.target_node.follow_system_log(patterns=[reg_exp])}
+                )
+                session.execute(cql)
+
+            for (ks_name, table_name, reg_exp), follower in log_followers.items():
+                wait_for(
+                    func=lambda: list(follower),
+                    timeout=900,
+                    text=f"Waiting for {reg_exp} on {ks_name}.{table_name}",
+                    throw_exc=False,
+                )
 
     @contextlib.contextmanager
     def argus_submit(

@@ -78,7 +78,7 @@ from sdcm.utils.cloud_monitor import cloud_report, cloud_qa_report
 from sdcm.utils.cloud_monitor.cloud_monitor import cloud_non_qa_report
 from sdcm.utils.lint.env_builder import build_env
 from sdcm.utils.lint.jenkins_parser import parse_jenkinsfile, discover_pipeline_files
-from sdcm.utils.oci_utils import list_instances_oci
+from sdcm.utils.oci_utils import get_scylla_images_by_branch, get_scylla_images_by_version, list_instances_oci
 from sdcm.utils.common import (
     S3Storage,
     aws_tags_to_dict,
@@ -118,7 +118,7 @@ from sdcm.utils.resources_cleanup import (
 from sdcm.utils.net import get_sct_runner_ip
 from sdcm.utils.jepsen import JepsenResults
 from sdcm.utils.docker_utils import docker_hub_login, running_in_podman
-from sdcm.monitorstack import (
+from sdcm.monitorstack.restore import (
     restore_monitoring_stack,
     get_monitoring_stack_services,
     kill_running_monitoring_stack_services,
@@ -298,6 +298,10 @@ def provision_resources(backend, test_name: str, config: str):
             layout = SCTProvisionLayout(params=params)
             layout.provision()
         elif backend in ("azure", "gce", "oci"):
+            if backend == "gce":
+                from sdcm.provision.gce.zone_resolver import GceAZResolver  # noqa: PLC0415
+
+                GceAZResolver(params).resolve()
             provision_sct_resources(params=params, test_config=test_config)
         elif backend == "xcloud":
             cloud_provider = params.get("xcloud_provider").lower()
@@ -1081,6 +1085,18 @@ def list_images(  # noqa: PLR0912, PLR0914
                         azure_images_json = images_dict_in_json_format(rows=rows, field_names=version_fields)
                         click.echo(azure_images_json)
 
+                case "oci":
+                    rows = get_scylla_images_by_version(version=version, region=region, arch=arch_enum)
+                    if output_format == "table":
+                        click.echo(
+                            rich_table_to_string(
+                                create_pretty_table(rows=rows, field_names=version_fields),
+                                title=f"OCI Machine Images by version in region {region}",
+                            )
+                        )
+                    elif output_format == "json":
+                        click.echo(images_dict_in_json_format(rows=rows, field_names=version_fields))
+
                 case _:
                     click.echo(f"Cloud provider {cloud_provider} is not supported")
 
@@ -1131,6 +1147,17 @@ def list_images(  # noqa: PLR0912, PLR0914
                     elif output_format == "json":
                         azure_images_json = images_dict_in_json_format(rows=rows, field_names=version_fields)
                         click.echo(azure_images_json)
+                case "oci":
+                    oci_images = get_scylla_images_by_branch(branch=branch, region=region, arch=arch_enum)
+                    if output_format == "table":
+                        click.echo(
+                            rich_table_to_string(
+                                create_pretty_table(rows=oci_images, field_names=branch_fields),
+                                title=f"OCI Machine Images for {branch} in region {region}",
+                            )
+                        )
+                    elif output_format == "json":
+                        click.echo(images_dict_in_json_format(rows=oci_images, field_names=branch_fields))
                 case _:
                     click.echo(f"Cloud provider {cloud_provider} is not supported")
 

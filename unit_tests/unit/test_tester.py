@@ -10,13 +10,16 @@
 # See LICENSE for more details.
 #
 # Copyright (c) 2020 ScyllaDB
+import json
 import logging
 import time
+import types
 import unittest.mock
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
+from sdcm.sct_config import SCTConfiguration
 from sdcm.sct_events import Severity
 from sdcm.sct_events.base import SctEvent
 from sdcm.sct_events.health import ClusterHealthValidatorEvent
@@ -421,7 +424,7 @@ class TestSaveSchema:
         tester.save_schema()
 
     def test_save_schema_saves_all_tables(self, tmp_path):
-        """Test that save_schema saves all expected tables including system.tablets."""
+        """Test that save_schema saves all expected tables and uploads compaction_history to S3."""
         tester = ClusterTesterForTests()
         tester._init_logging(tmp_path / "test_save_schema")
         tester.logdir = str(tmp_path)
@@ -439,22 +442,47 @@ class TestSaveSchema:
         tester.db_cluster = MagicMock()
         tester.db_cluster.nodes = [mock_node]
 
-        # Run save_schema
-        tester.save_schema()
+        # Mock the upload_system_table_to_s3 function and argus_collect_logs
+        with (
+            patch("sdcm.tester.upload_system_table_to_s3") as mock_upload,
+            patch.object(tester, "argus_collect_logs") as mock_argus_logs,
+        ):
+            mock_upload.return_value = (
+                "https://s3.amazonaws.com/test-bucket/test.jsonl.tar.gz",
+                "system_compaction_history-20260524_092654-node-1.jsonl.tar.gz",
+            )
 
-        # Verify run_cqlsh was called with expected commands
+            # Run save_schema
+            tester.save_schema()
+
+            # Verify upload_system_table_to_s3 was called for compaction_history
+            mock_upload.assert_called_once()
+            call_args = mock_upload.call_args
+            assert call_args[1]["node"] == mock_node
+            assert call_args[1]["table_name"] == "system.compaction_history"
+
+            # Verify argus_collect_logs was called with the S3 link
+            mock_argus_logs.assert_called_once_with(
+                {
+                    "system_compaction_history-20260524_092654-node-1.jsonl.tar.gz": "https://s3.amazonaws.com/test-bucket/test.jsonl.tar.gz"
+                }
+            )
+
+        # Verify run_cqlsh was called with expected commands (but NOT for compaction_history)
         cqlsh_calls = [call[0][0] for call in mock_node.run_cqlsh.call_args_list]
         assert "desc schema" in cqlsh_calls
         assert "select JSON * from system_schema.tables" in cqlsh_calls
         assert "select JSON * from system.truncated" in cqlsh_calls
         assert "select JSON * from system.tablets" in cqlsh_calls
+        assert "select JSON * from system.compaction_history" not in cqlsh_calls  # Now uploaded directly to S3
         assert "desc schema with internals" in cqlsh_calls
 
-        # Verify files were created
+        # Verify files were created (except compaction_history which goes to S3)
         assert (tmp_path / "schema.log").exists()
         assert (tmp_path / "system_schema_tables.log").exists()
         assert (tmp_path / "system_truncated.log").exists()
         assert (tmp_path / "system_tablets.log").exists()
+        assert not (tmp_path / "system_compaction_history.log").exists()  # Not saved locally anymore
         assert (tmp_path / "schema_with_internals.log").exists()
 
     def test_save_schema_node_not_ready(self, tmp_path):
@@ -592,3 +620,97 @@ class TestEmrCleanResources:
         """Test that clean_resources handles None emr_cluster gracefully."""
         tester = self._make_tester(self._make_params("destroy"))
         self._run_clean_resources(tester, critical_events=False)
+
+
+# --- Tests for ClusterTester.init_argus_run() Argus config submission ---
+
+
+@pytest.fixture()
+def tester_with_argus(monkeypatch):
+    """Create a minimal ClusterTester-like object with mocked Argus client and real SCTConfiguration.
+
+    Uses MagicMock as `self` because ClusterTester.__init__ has heavy side effects
+    (events system, monitoring, cloud provisioning) that cannot be trivially mocked.
+    We bind only the method under test to preserve real logic while isolating I/O.
+
+    The bound init_argus_run already wraps all external I/O functions (git, network)
+    so tests can simply call ``tester.init_argus_run()`` without extra patching.
+    """
+    monkeypatch.setenv("SCT_CLUSTER_BACKEND", "aws")
+    monkeypatch.setenv("SCT_AMI_ID_DB_SCYLLA", "ami-dummy")
+    monkeypatch.setenv("SCT_INSTANCE_TYPE_DB", "i4i.large")
+    monkeypatch.setenv("SCT_CONFIG_FILES", "unit_tests/test_configs/minimal_test_case.yaml")
+    monkeypatch.setenv("SCT_ADAPTIVE_TIMEOUT_MULTIPLIERS", "{'decommission': 5, 'new_node': 5}")
+
+    params = SCTConfiguration()
+
+    mock_argus_client = MagicMock()
+    mock_argus_client.run_id = "test-run-id"
+
+    mock_test_config = MagicMock()
+    mock_test_config.argus_client.return_value = mock_argus_client
+
+    # MagicMock as self: ClusterTester.__init__ has heavy side effects;
+    # we bind only the method under test.
+    tester = MagicMock()
+    tester.params = params
+    tester.test_config = mock_test_config
+    tester.log = logging.getLogger("test_init_argus_run")
+
+    monkeypatch.setattr(
+        "sdcm.tester.get_git_status_info",
+        lambda: {
+            "branch.oid": "abc123",
+            "upstream.url": "git@github.com:test",
+            "branch.upstream": "origin/main",
+        },
+    )
+    monkeypatch.setattr("sdcm.tester.get_git_commit_id", lambda: "abc123")
+    monkeypatch.setattr("sdcm.tester.get_job_name", lambda: "test-job")
+    monkeypatch.setattr("sdcm.tester.get_job_url", lambda: "http://jenkins/job/1")
+    monkeypatch.setattr("sdcm.tester.get_username", lambda: "test-user")
+    monkeypatch.setattr("sdcm.tester.get_sct_runner_ip", lambda: "1.2.3.4")
+    monkeypatch.setattr("sdcm.tester.get_my_ip", lambda: "10.0.0.1")
+
+    tester.init_argus_run = types.MethodType(ClusterTester.init_argus_run, tester)
+
+    return tester, mock_argus_client
+
+
+def test_init_argus_run_pydantic_root_model_serializes_valid_json(tester_with_argus):
+    """Regression: json.dumps previously raised ValueError (circular reference) with AdaptiveTimeoutMultipliers."""
+    tester, mock_argus_client = tester_with_argus
+
+    tester.init_argus_run()
+
+    content = mock_argus_client.sct_submit_config.call_args.kwargs["content"]
+    parsed = json.loads(content)
+    assert isinstance(parsed, dict), f"Expected dict, got {type(parsed).__name__}"
+    assert parsed["adaptive_timeout_multipliers"] == {"decommission": 5.0, "new_node": 5.0}, (
+        f"adaptive_timeout_multipliers not serialized correctly: {parsed.get('adaptive_timeout_multipliers')}"
+    )
+
+
+def test_init_argus_run_config_contains_essential_fields(tester_with_argus):
+    """Verify essential SCT config fields are present in the submitted JSON."""
+    tester, mock_argus_client = tester_with_argus
+
+    tester.init_argus_run()
+
+    content = mock_argus_client.sct_submit_config.call_args.kwargs["content"]
+    parsed = json.loads(content)
+    assert parsed["cluster_backend"] == "aws"
+    assert "instance_type_db" in parsed
+
+
+def test_init_argus_run_config_excludes_internal_fields(tester_with_argus):
+    """Fields marked with exclude=True must not appear in the submitted config."""
+    tester, mock_argus_client = tester_with_argus
+
+    tester.init_argus_run()
+
+    content = mock_argus_client.sct_submit_config.call_args.kwargs["content"]
+    parsed = json.loads(content)
+    assert "multi_region_params" not in parsed
+    assert "regions_data" not in parsed
+    assert "target_db_image_ids" not in parsed

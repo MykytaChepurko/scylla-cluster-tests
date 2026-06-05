@@ -34,7 +34,6 @@ from uuid import uuid4
 from functools import partial, wraps, cache
 import threading
 import signal
-import json
 import botocore
 import yaml
 import pytest
@@ -52,6 +51,7 @@ from sdcm import nemesis, cluster_docker, cluster_k8s, cluster_baremetal, wait
 from sdcm.cloud_api_client import ScyllaCloudAPIClient
 from sdcm.provision.azure.kms_provider import AzureKmsProvider
 from sdcm.provision.gce.kms_provider import GcpKmsProvider
+from sdcm.provision.gce.zone_resolver import GceAZResolver
 from sdcm.cluster import (
     BaseCluster,
     NoMonitorSet,
@@ -80,6 +80,8 @@ from sdcm.cluster_k8s.eks import MonitorSetEKS
 from sdcm.cluster_cloud import ScyllaCloudCluster
 from sdcm.cql_stress_cassandra_stress_thread import CqlStressCassandraStressThread
 from sdcm.mgmt import get_scylla_manager_tool
+from sdcm.provision.aws.az_resolver import AZResolver, is_az_fallback_enabled, run_pre_flight_capacity_probe
+from sdcm.provision.aws.capacity_errors import ProvisioningCapacityExhausted, is_capacity_error
 from sdcm.provision.aws.capacity_reservation import SCTCapacityReservation
 from sdcm.kafka.kafka_cluster import LocalKafkaCluster
 from sdcm.provision.aws.emr_provisioner import EmrClusterProvisioner, ensure_emr_roles
@@ -164,7 +166,12 @@ from sdcm.sct_events.system import InfoEvent, TestFrameworkEvent, TestResultEven
 from sdcm.sct_events.file_logger import get_events_grouped_by_category, get_logger_event_summary
 from sdcm.sct_events.events_analyzer import stop_events_analyzer
 from sdcm.sct_events.grafana import start_posting_grafana_annotations
-from sdcm.stress_thread import CassandraStressThread, get_timeout_from_stress_cmd
+from sdcm.stress_thread import (
+    CassandraStressThread,
+    apply_gemini_stress_duration,
+    extract_gemini_seed,
+    get_timeout_from_stress_cmd,
+)
 from sdcm.gemini_thread import GeminiStressThread
 from sdcm.utils.log_time_consistency import DbLogTimeConsistencyAnalyzer
 from sdcm.utils.net import get_my_ip, get_sct_runner_ip
@@ -198,6 +205,7 @@ from sdcm.logcollector import (
     VectorStoreLogCollector,
 )
 from sdcm.utils import alternator
+from sdcm.utils.sstable.s3_uploader import upload_system_table_to_s3
 from sdcm.remote import RemoteCmdRunnerBase, LOCALRUNNER
 from sdcm.utils.gce_utils import get_gce_compute_instances_client
 from sdcm.utils.auth_context import temp_authenticator
@@ -437,7 +445,7 @@ class ClusterTester(unittest.TestCase):
                 backend=self.params.get("cluster_backend"),
             )
             self.log.info("sct_runner info in Argus TestRun is updated")
-            self.test_config.argus_client().sct_submit_config(name="sct_config", content=json.dumps(dict(self.params)))
+            self.test_config.argus_client().sct_submit_config(name="sct_config", content=self.params.model_dump_json())
             self.log.info("Submitted SCTConfiguration to Argus.")
         except ArgusClientError:
             self.log.error("Failed to submit data to Argus", exc_info=True)
@@ -724,11 +732,7 @@ class ClusterTester(unittest.TestCase):
             seed = self.params.get("gemini_seed")
             gemini_command, *_ = self.gemini_results["cmd"]
             if not seed:
-                seed_match = re.search(r"--seed (?P<seed>\d+) ", gemini_command)
-                if seed_match:
-                    seed = seed_match.groupdict().get("seed", -1)
-                else:
-                    seed = -1
+                seed = extract_gemini_seed(gemini_command)
 
             results = self.gemini_results["results"]
             results = results[0] if len(results) > 0 else None
@@ -758,7 +762,7 @@ class ClusterTester(unittest.TestCase):
             self.log.warning("Error submitting gemini results to argus", exc_info=True)
 
     def collect_ssl_conf(self):
-        shutil.copytree(Path(get_data_dir_path("ssl_conf")), Path(self.logdir) / "ssl_conf")
+        shutil.copytree(Path(get_data_dir_path("ssl_conf")), Path(self.logdir) / "ssl_conf", dirs_exist_ok=True)
 
     def _init_data_validation(self):
         if data_validation := self.params.get("data_validation"):
@@ -767,7 +771,7 @@ class ClusterTester(unittest.TestCase):
         return None
 
     def _init_ldap(self):
-        self.params["are_ldap_users_on_scylla"] = False
+        self.test_config.LDAP_USERS_ON_SCYLLA = False
 
         match self.params.get("ldap_server_type"):
             case LdapServerType.MS_AD:
@@ -793,7 +797,7 @@ class ClusterTester(unittest.TestCase):
         for user in LDAP_USERS:
             node.run_cqlsh(f"CREATE ROLE '{user}' WITH login=true")
         node.run_cqlsh(f"ALTER ROLE '{LDAP_USERS[0]}' with SUPERUSER=true and password='{LDAP_PASSWORD}'")
-        self.params["are_ldap_users_on_scylla"] = True
+        self.test_config.LDAP_USERS_ON_SCYLLA = True
 
     def configure_ldap(self, node, use_ssl=False):
         self.test_config.configure_ldap(node=node, use_ssl=use_ssl)
@@ -1600,6 +1604,8 @@ class ClusterTester(unittest.TestCase):
         return nemesis_threads
 
     def get_cluster_gce(self, loader_info, db_info, monitor_info):  # noqa: PLR0912, PLR0914
+        GceAZResolver(self.params).resolve()
+
         datacenters = self.params.gce_datacenters
         test_id = str(TestConfig().test_id())
         provisioners: List[GceProvisioner] = []
@@ -1865,6 +1871,34 @@ class ClusterTester(unittest.TestCase):
             self.monitors = NoMonitorSet()
 
     def get_cluster_aws(self, loader_info, db_info, monitor_info):
+        AZResolver(self.params).resolve()
+
+        # capacity reservation handles its own AZ fallback internally
+        cr_enabled = SCTCapacityReservation.is_capacity_reservation_enabled(self.params)
+        fallback_enabled = is_az_fallback_enabled(self.params) and not cr_enabled
+
+        self._populate_aws_info_dicts(loader_info, db_info, monitor_info)
+
+        original_az = self.params.get("availability_zone")
+        if fallback_enabled and (az_candidates := AZResolver(self.params).get_fallback_candidates()):
+            candidates = az_candidates
+        else:
+            candidates = [original_az.split(",") if original_az else []]
+
+        region_exhausted, last_error = self._provision_legacy_with_az_fallback(
+            loader_info, db_info, monitor_info, candidates, last_error=None
+        )
+        if not region_exhausted:
+            return
+
+        self.params["availability_zone"] = original_az
+        tried = ", ".join("+".join(c) for c in candidates)
+        raise CriticalTestFailure(
+            f"Failed creating AWS clusters in all {len(candidates)} AZ candidate(s) [{tried}]: {last_error}"
+        ) from last_error
+
+    def _populate_aws_info_dicts(self, loader_info: dict, db_info: dict, monitor_info: dict) -> None:
+        """Fill missing AWS info values for the current region."""
         regions = self.params.get("region_name").split()
 
         if loader_info["n_nodes"] is None:
@@ -1894,12 +1928,71 @@ class ClusterTester(unittest.TestCase):
 
         init_db_info_from_params(db_info, params=self.params, regions=regions)
         init_monitoring_info_from_params(monitor_info, params=self.params, regions=regions)
-        user_prefix = self.params.get("user_prefix")
 
-        user_credentials = self.params.get("user_credentials_path")
+    def _provision_legacy_with_az_fallback(
+        self,
+        loader_info: dict,
+        db_info: dict,
+        monitor_info: dict,
+        candidates: list[list[str]],
+        last_error: Exception | None,
+    ) -> tuple[bool, Exception | None]:
+        """Try AZ candidates in the current region.
+
+        Return `(False, last_error)` on success, or `(True, last_error)` if all
+        candidates fail with capacity errors.
+        """
+        for attempt_idx, candidate in enumerate(candidates, start=1):
+            if candidate:
+                self.params["availability_zone"] = ",".join(candidate)
+
+            if attempt_idx > 1:
+                self.log.warning(
+                    "Capacity error in previous AZ; retrying in '%s' (attempt %d/%d)",
+                    self.params["availability_zone"],
+                    attempt_idx,
+                    len(candidates),
+                )
+                self._cleanup_legacy_partial_aws_clusters()
+
+            try:
+                self._provision_legacy_aws_clusters(loader_info, db_info, monitor_info)
+                return False, last_error
+            except (botocore.exceptions.ClientError, ProvisioningCapacityExhausted) as exc:
+                if isinstance(exc, botocore.exceptions.ClientError) and not is_capacity_error(exc):
+                    raise
+                last_error = exc
+                self.log.warning(
+                    "Provision failed with capacity error in AZ '%s': %s",
+                    self.params.get("availability_zone"),
+                    exc,
+                )
+
+        return True, last_error
+
+    def _cleanup_legacy_partial_aws_clusters(self) -> None:
+        """Destroy partially created AWS clusters before retrying provisioning."""
+        for attr in ("db_cluster", "cs_db_cluster", "loaders", "monitors"):
+            cluster = getattr(self, attr, None)
+            if cluster is None or isinstance(cluster, NoMonitorSet):
+                continue
+            with contextlib.suppress(Exception):
+                cluster.destroy()
+            setattr(self, attr, None)
+
+        self.credentials = []
+
+    def _provision_legacy_aws_clusters(self, loader_info, db_info, monitor_info):
+        """Provision AWS clusters using the current region and availability zone.
+
+        Used by `get_cluster_aws` to retry provisioning with different AZs.
+        """
+        run_pre_flight_capacity_probe(self.params)
 
         regions = self.params.get("region_name").split()
         services = get_ec2_services(regions)
+        user_prefix = self.params.get("user_prefix")
+        user_credentials = self.params.get("user_credentials_path")
 
         for _ in regions:
             self.credentials.append(UserRemoteCredentials(key_file=user_credentials))
@@ -1908,47 +2001,9 @@ class ClusterTester(unittest.TestCase):
         for idx, ami_id in enumerate(ami_ids):
             wait_ami_available(services[idx].meta.client, ami_id)
 
-        def _get_all_zones_common_params() -> list[dict]:
-            all_zones_common_params = []
-            aws_region = AwsRegion(region_name=regions[0])
-            availability_zones = [
-                zone[-1]
-                for zone in aws_region.get_availability_zones_for_instance_type(self.params.get("instance_type_db"))
-            ]
-            for zone in availability_zones:
-                all_zones_common_params.append(
-                    get_common_params(
-                        params=self.params,
-                        regions=regions,
-                        credentials=self.credentials,
-                        services=services,
-                        availability_zone=zone,
-                    )
-                )
-            return all_zones_common_params
-
         common_params = get_common_params(
             params=self.params, regions=regions, credentials=self.credentials, services=services
         )
-
-        def _create_auto_zone_scylla_aws_cluster():
-            capacity_errors = []
-            for cl_zone_params in _get_all_zones_common_params():
-                cl_zone_params.update(_get_instance_params())
-                try:
-                    return ScyllaAWSCluster(
-                        ec2_ami_id=self.params.get("ami_id_db_scylla").split(),
-                        ec2_ami_username=self.params.get("ami_db_scylla_user"),
-                        **cl_zone_params,
-                    )
-                except botocore.exceptions.ClientError as error:
-                    capacity_error_keywards = ["Unsupported", "InsufficientInstanceCapacity"]
-                    if any(capacity_error in str(error) for capacity_error in capacity_error_keywards):
-                        self.log.warning("Failed creating a Scylla AWS cluster: %s", error)
-                        capacity_errors.append(error)
-                    else:
-                        raise
-            raise CriticalTestFailure(f"Failed creating a Scylla AWS cluster: {capacity_errors}")
 
         def _get_instance_params() -> dict:
             return dict(
@@ -1961,8 +2016,6 @@ class ClusterTester(unittest.TestCase):
             cl_params = _get_instance_params()
             cl_params.update(common_params)
             if db_type == "scylla":
-                if self.params.get("aws_fallback_to_next_availability_zone"):
-                    return _create_auto_zone_scylla_aws_cluster()
                 return ScyllaAWSCluster(
                     ec2_ami_id=self.params.get("ami_id_db_scylla").split(),
                     ec2_ami_username=self.params.get("ami_db_scylla_user"),
@@ -2098,10 +2151,6 @@ class ClusterTester(unittest.TestCase):
                 node_key_file=self.credentials[0].key_file,
             )
 
-        # TODO: for Docker backend, loaders are Scylla containers used only as a Docker host
-        # to launch stress tool containers (RemoteDocker) via docker-in-docker.
-        # This is wasteful — stress containers could run directly on the host via LOCALRUNNER.
-        # See docs/plans/infrastructure/cassandra-cluster-support.md for refactor notes.
         self.loaders = cluster_docker.LoaderSetDocker(
             n_nodes=self.params.get("n_loaders"), **container_node_params, **common_params
         )
@@ -3110,10 +3159,9 @@ class ClusterTester(unittest.TestCase):
     def run_gemini(self, cmd, duration=None):
         if duration:
             timeout = self.get_duration(duration)
-        elif self._stress_duration and " --duration" in cmd:
+        elif self._stress_duration:
             timeout = self.get_duration(self._stress_duration)
-            cmd = re.sub(r"\s--duration\s+\d+[mhd]\s", f" --duration {self._stress_duration}m ", cmd)
-            cmd = re.sub(r"\s--warmup\s+\d+[mhd]\s", f" --warmup {int(self._stress_duration * 0.2)}m ", cmd)
+            cmd = apply_gemini_stress_duration(cmd, self._stress_duration)
         else:
             timeout = get_timeout_from_stress_cmd(cmd) or self.get_duration(duration)
         return GeminiStressThread(
@@ -3721,10 +3769,8 @@ class ClusterTester(unittest.TestCase):
         with silence(parent=self, name="Kill Stress Threads"):
             self.kill_stress_thread()
 
-        # Stopping nemesis, using timeout of 30 minutes, since replace/decommission node can take time
         if self.db_cluster:
             self.get_nemesis_report(self.db_cluster)
-            self.stop_nemesis(self.db_cluster)
             self.stop_resources_stop_tasks_threads(self.db_cluster)
             self.get_backtraces(self.db_cluster)
 
@@ -3914,14 +3960,19 @@ class ClusterTester(unittest.TestCase):
                         doctor.install_scylla_doctor()
                         doctor.run_scylla_doctor_and_collect_results()
 
+                        download_with_sudo = not node.is_nonroot_install
                         if doctor.json_result_file:
                             local_json_path = os.path.join(self.logdir, f"scylla_doctor_{node.name}_vitals.json")
-                            node.remoter.receive_files(src=doctor.json_result_file, dst=local_json_path)
+                            node.remoter.receive_files(
+                                src=doctor.json_result_file, dst=local_json_path, sudo=download_with_sudo
+                            )
                             self.log.debug("Downloaded scylla-doctor vitals from %s to %s", node.name, local_json_path)
 
                         if doctor.scylla_logs_file:
                             local_logs_path = os.path.join(self.logdir, f"scylla_doctor_{node.name}_logs.tar.gz")
-                            node.remoter.receive_files(src=doctor.scylla_logs_file, dst=local_logs_path)
+                            node.remoter.receive_files(
+                                src=doctor.scylla_logs_file, dst=local_logs_path, sudo=download_with_sudo
+                            )
                             self.log.debug("Downloaded scylla-doctor logs from %s to %s", node.name, local_logs_path)
 
                         self.log.info("Scylla-doctor completed for node %s", node.name)
@@ -3957,6 +4008,12 @@ class ClusterTester(unittest.TestCase):
             self.save_cqlsh_output_in_file(
                 node=node, cmd="select JSON * from system.tablets", log_file="system_tablets.log"
             )
+            # Upload system.compaction_history directly to S3 to avoid loading large data into memory
+            s3_link, s3_filename = upload_system_table_to_s3(
+                node=node, table_name="system.compaction_history", test_id=self.test_config.test_id()
+            )
+            if s3_link:
+                self.argus_collect_logs({s3_filename: s3_link})
             self.save_cqlsh_output_in_file(
                 node=node, cmd="desc schema with internals", log_file="schema_with_internals.log"
             )
@@ -3967,6 +4024,10 @@ class ClusterTester(unittest.TestCase):
 
     def tearDown(self):
         self.teardown_started = True
+        # Stop nemesis first — if still running, it keeps disrupting nodes and
+        # diagnostic commands (gather_failure_statistics, validators) hang indefinitely.
+        if self.db_cluster:
+            self.stop_nemesis(self.db_cluster)
         with silence(parent=self, name="Enabling teardown filters"):
             enable_teardown_filters()
         with silence(parent=self, name="Sending test end event"):

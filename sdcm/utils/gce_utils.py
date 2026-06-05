@@ -21,6 +21,7 @@ import uuid
 from functools import cached_property
 from typing import Any, List, Literal, TYPE_CHECKING
 
+import google.api_core.exceptions
 from google.oauth2 import service_account
 from google.cloud import compute_v1
 from google.cloud.compute_v1 import Image
@@ -85,15 +86,13 @@ def vmarch_to_gcp(arch: "VmArch") -> str:
         raise ValueError(f"Unsupported architecture: {arch}")
 
 
-# The keys are the region name, the value is the available zones, which will be used for random.choice()
-SUPPORTED_REGIONS = {
-    # us-east1 zones: b, c, and d. Details: https://cloud.google.com/compute/docs/regions-zones#locations
-    # Currently choose only zones c and d as zone b frequently fails allocating resources.
-    "us-east1": "cd",
-    "us-east4": "abc",
-    "us-west1": "abc",
-    "us-central1": "a",
-}
+# Regions where SCT has infrastructure (VPCs, firewall rules, etc.)
+SUPPORTED_REGIONS = [
+    "us-east1",
+    "us-east4",
+    "us-west1",
+    "us-central1",
+]
 
 
 SUPPORTED_PROJECTS = {"gcp-sct-project-1", "gcp-local-ssd-latency"} | {
@@ -101,11 +100,49 @@ SUPPORTED_PROJECTS = {"gcp-sct-project-1", "gcp-local-ssd-latency"} | {
 }
 
 
+def _get_zone_letters_for_region(region: str) -> list[str]:
+    """Query GCE Regions API to get available zone letters for a region."""
+    try:
+        regions_client, _ = get_gce_compute_regions_client()
+        region_info = regions_client.get(project=KeyStore().get_gcp_credentials()["project_id"], region=region)
+        return [z.rsplit("/", 1)[-1].split("-")[-1] for z in region_info.zones]
+    except Exception:  # noqa: BLE001
+        LOGGER.warning("Failed to get zones from GCE API for region %s", region)
+        return []
+
+
 def random_zone(region: str) -> str:
-    availability_zones = SUPPORTED_REGIONS.get(region, None)
-    if not availability_zones:
-        raise Exception(f"Unsupported region: {region}")
-    return f"{random.choice(availability_zones)}"
+    zone_letters = _get_zone_letters_for_region(region)
+    if not zone_letters:
+        raise Exception(f"No zones found for region: {region}")
+    return random.choice(zone_letters)
+
+
+def get_alternative_zones(region: str, exhausted_zone: str, machine_types: list[str] | None = None) -> list[str]:
+    """Return alternative zone letters for a region, excluding the exhausted zone.
+
+    Used by runtime fallback when provisioning fails with ZoneResourcesExhaustedError.
+    If machine_types are provided, only zones supporting ALL of them are returned.
+    """
+    exhausted_letter = exhausted_zone[-1] if len(exhausted_zone) > 1 else exhausted_zone
+
+    if machine_types:
+        resolver = GceZoneResolver()
+        common_zones = resolver.get_common_zones(
+            region=region,
+            machine_types=machine_types,
+            preferred_zones=resolver.get_zones_for_region(region),
+        )
+        # Extract letters from full zone names (e.g., "us-east4-a" -> "a")
+        valid_letters = [zone.split("-")[-1] for zone in common_zones]
+        alternatives = [z for z in valid_letters if z != exhausted_letter]
+    else:
+        zone_letters = _get_zone_letters_for_region(region)
+        if not zone_letters:
+            return []
+        alternatives = [z for z in zone_letters if z != exhausted_letter]
+
+    return alternatives
 
 
 def get_gce_compute_instances_client() -> tuple[compute_v1.InstancesClient, dict]:
@@ -150,6 +187,67 @@ def get_gce_storage_client() -> tuple[storage.Client, dict]:
     return storage.Client(credentials=credentials), info
 
 
+def create_gce_storage_bucket(name: str, region: str, object_lock_enabled: bool = False) -> storage.Bucket:
+    """Create a GCS bucket.
+
+    Args:
+        name: bucket name
+        region: GCS region (e.g., 'us-east1')
+        object_lock_enabled: if True, enables object retention (object lock) on the bucket.
+                             Requires uniform bucket-level access (set automatically).
+
+    Returns:
+        the created Bucket object
+    """
+    storage_client, _ = get_gce_storage_client()
+
+    bucket = storage_client.bucket(name)
+    if object_lock_enabled:
+        bucket.iam_configuration.uniform_bucket_level_access_enabled = True
+
+    storage_client.create_bucket(
+        bucket,
+        location=region,
+        enable_object_retention=object_lock_enabled,
+    )
+    LOGGER.info("Created GCS bucket gs://%s in %s (object_lock_enabled=%s)", name, region, object_lock_enabled)
+    return bucket
+
+
+def gce_override_object_retention(bucket_name: str, path: str) -> None:
+    """Override governance-mode object retention locks on blobs in a GCS bucket.
+
+    Processes all matching blobs individually — if one blob fails, the rest are
+    still attempted. Raises after all blobs have been processed if any failed.
+
+    Args:
+        bucket_name: the name of the GCS bucket
+        path: path prefix to match blobs (empty string means all blobs)
+    """
+    storage_client, _ = get_gce_storage_client()
+
+    if path.startswith("/"):
+        path = path[1:]
+
+    blobs = list(storage_client.list_blobs(bucket_or_name=bucket_name, prefix=path))
+    if not blobs:
+        LOGGER.warning("No blobs found in gs://%s/%s to unlock", bucket_name, path)
+        return
+
+    LOGGER.info("Overriding retention on %d blob(s) in gs://%s/%s", len(blobs), bucket_name, path)
+    failed = []
+    for blob in blobs:
+        try:
+            blob.retention.mode = None
+            blob.retention.retain_until_time = None
+            blob.patch(override_unlocked_retention=True)
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.error("Failed to override retention on gs://%s/%s: %s", bucket_name, blob.name, exc)
+            failed.append((blob.name, exc))
+    if failed:
+        raise RuntimeError(f"Failed to override retention on {len(failed)}/{len(blobs)} blob(s) in gs://{bucket_name}")
+
+
 def get_gce_compute_disks_client() -> tuple[compute_v1.DisksClient, dict]:
     info = KeyStore().get_gcp_credentials()
     credentials = service_account.Credentials.from_service_account_info(info)
@@ -160,6 +258,70 @@ def get_gce_compute_machine_types_client() -> tuple[compute_v1.MachineTypesClien
     info = KeyStore().get_gcp_credentials()
     credentials = service_account.Credentials.from_service_account_info(info)
     return compute_v1.MachineTypesClient(credentials=credentials), info
+
+
+class GceZoneResolver:
+    """Resolves available zones for machine types in a GCE project/region."""
+
+    def __init__(self, project: str | None = None):
+        if project:
+            self._project = project
+        else:
+            info = KeyStore().get_gcp_credentials()
+            self._project = info["project_id"]
+        self._machine_types_client, _ = get_gce_compute_machine_types_client()
+
+    def get_zones_for_region(self, region: str) -> list[str]:
+        try:
+            regions_client, _ = get_gce_compute_regions_client()
+            region_info = regions_client.get(project=self._project, region=region)
+            return [z.rsplit("/", 1)[-1] for z in region_info.zones]
+        except Exception:  # noqa: BLE001
+            LOGGER.warning("Failed to get zones from GCE API for region %s", region)
+            return []
+
+    def get_zones_for_machine_type(self, region: str, machine_type: str) -> list[str]:
+        """Return zones in a region where the given machine type is available."""
+        all_zones = self.get_zones_for_region(region)
+        available = []
+        for zone in all_zones:
+            try:
+                self._machine_types_client.get(project=self._project, zone=zone, machine_type=machine_type)
+                available.append(zone)
+            except google.api_core.exceptions.NotFound:
+                continue
+            except Exception:  # noqa: BLE001
+                LOGGER.warning("Error checking machine type %s in zone %s; skipping", machine_type, zone)
+                continue
+        return available
+
+    def get_common_zones(
+        self,
+        region: str,
+        machine_types: list[str],
+        preferred_zones: list[str] | None = None,
+    ) -> list[str]:
+        """Return zones in the region that support ALL given machine types."""
+        if not machine_types:
+            return []
+
+        zones_per_type = [set(self.get_zones_for_machine_type(region, mt)) for mt in machine_types]
+        common_zones = set.intersection(*zones_per_type) if zones_per_type else set()
+
+        preferred_zones = preferred_zones or []
+        missing = [z for z in preferred_zones if z not in common_zones]
+        if missing:
+            LOGGER.warning("Preferred zones %s do not support all required machine types %s", missing, machine_types)
+
+        ordered = [z for z in preferred_zones if z in common_zones]
+        ordered += [z for z in sorted(common_zones) if z not in ordered]
+
+        LOGGER.info("Zones in %s supporting %s: %s", region, machine_types, ordered)
+        return ordered
+
+    def get_per_type_zones(self, region: str, machine_types: list[str]) -> dict[str, list[str]]:
+        """Return a mapping of machine_type -> available zones in the region."""
+        return {mt: self.get_zones_for_machine_type(region, mt) for mt in machine_types}
 
 
 def gce_public_addresses(instance: compute_v1.Instance) -> list[str]:
@@ -624,6 +786,13 @@ def create_instance(  # noqa: PLR0913
         instance.scheduling.on_host_maintenance = "TERMINATE"
         instance.scheduling.provisioning_model = compute_v1.Scheduling.ProvisioningModel.SPOT.name
         instance.scheduling.instance_termination_action = instance_termination_action
+    elif machine_type.split("/")[-1].startswith("e2-"):
+        # e2 family supports only on_host_maintenance=MIGRATE for non-spot VMs
+        instance.scheduling.on_host_maintenance = "MIGRATE"
+    else:
+        # avoid live migration and unexpected restarts disrupting tests
+        instance.scheduling.on_host_maintenance = "TERMINATE"
+        instance.scheduling.automatic_restart = False
 
     if custom_hostname is not None:
         # Set the custom hostname for the instance

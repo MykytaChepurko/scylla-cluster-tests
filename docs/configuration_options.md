@@ -561,7 +561,7 @@ A local directory of rpms to install a custom version on top of<br>the scylla in
 
 The port of scylla management
 
-**default:** branch-4.14
+**default:** branch-4.15
 
 **type:** str
 * appendable
@@ -685,6 +685,15 @@ instance_provision: spot|on_demand|spot_fleet
 instance_provision_fallback_on_demand: create instance on_demand provision type if instance with selected 'instance_provision' type creation failed. Expected values: true|false (default - false
 
 **default:** N/A
+
+**type:** bool
+
+
+## **enable_kernel_panic_checker** / SCT_ENABLE_KERNEL_PANIC_CHECKER
+
+Enable kernel panic detection by monitoring cloud instance console output for panic indicators. When enabled, a background thread monitors each node's console output for kernel panic patterns.
+
+**default:** True
 
 **type:** bool
 
@@ -910,7 +919,7 @@ Set the write isolation for the alternator table, see https://github.com/scyllad
 
 If true, spawn a docker with a dns server for the ycsb loader to point to
 
-**default:** N/A
+**default:** True
 
 **type:** bool
 
@@ -919,7 +928,7 @@ If true, spawn a docker with a dns server for the ycsb loader to point to
 
 If true, enable native load balancing for alternator
 
-**default:** True
+**default:** N/A
 
 **type:** bool
 
@@ -2032,6 +2041,15 @@ Store adaptive timeout metrics in Argus. Disabled for performance tests only.
 **type:** bool
 
 
+## **adaptive_timeout_multipliers** / SCT_ADAPTIVE_TIMEOUT_MULTIPLIERS
+
+Optional dict of adaptive-timeout multipliers keyed by operation name (from Operations enum value[0], e.g. decommission, remove_node, new_node, repair, etc.). If the current operation key is absent, multiplier 1.0 is used.<br>YAML example:<br>adaptive_timeout_multipliers:<br>  decommission: 4<br>  new_node: 2<br>Environment variable examples:<br>SCT_ADAPTIVE_TIMEOUT_MULTIPLIERS="{'decommission': 4, 'new_node': 2}"<br>Or dot-notation: SCT_ADAPTIVE_TIMEOUT_MULTIPLIERS.decommission=4
+
+**default:** N/A
+
+**type:** sdcm.sct_config.AdaptiveTimeoutMultipliers
+
+
 ## **gce_n_local_ssd_disk_monitor** / SCT_GCE_N_LOCAL_SSD_DISK_MONITOR
 
 Number of local SSD disks for monitor nodes in Google Compute Engine
@@ -3059,7 +3077,7 @@ Time to wait for compaction to finish at the end of prepare stage. Use only when
 
 Compaction strategy to use for pre-created schema
 
-**default:** SizeTieredCompactionStrategy
+**default:** IncrementalCompactionStrategy
 
 **type:** str
 * appendable
@@ -3353,6 +3371,16 @@ enable debug for cassandra-stress
 **default:** N/A
 
 **type:** bool
+
+
+## **cs_extra_jvm_opts** / SCT_CS_EXTRA_JVM_OPTS
+
+Extra JVM options passed to cassandra-stress via JVM_OPTS environment variable. Recommended for low-latency: '-XX:+UseZGC -XX:+ZGenerational -Xms8g -Xmx8g -XX:+AlwaysPreTouch' (requires Java 21+, which cassandra-stress 3.20.6+ ships with).
+
+**default:** N/A
+
+**type:** str
+* appendable
 
 
 ## **stress_cmd_mv** / SCT_STRESS_CMD_MV
@@ -4016,7 +4044,34 @@ Availability zone to use. Specify multiple (comma separated) to deploy resources
 
 ## **aws_fallback_to_next_availability_zone** / SCT_AWS_FALLBACK_TO_NEXT_AVAILABILITY_ZONE
 
-Try all availability zones one by one in order to maximize the chances of getting the requested instance capacity.
+Deprecated alias of `fallback_to_next_availability_zone`. Kept for backward compatibility.
+
+**default:** N/A
+
+**type:** bool
+
+
+## **fallback_to_next_availability_zone** / SCT_FALLBACK_TO_NEXT_AVAILABILITY_ZONE
+
+On capacity errors, automatically retry provisioning in the next available AZ in the same region. Backend-agnostic parameter; supersedes `aws_fallback_to_next_availability_zone`.
+
+**default:** N/A
+
+**type:** bool
+
+
+## **pre_filter_unavailable_availability_zones** / SCT_PRE_FILTER_UNAVAILABLE_AVAILABILITY_ZONES
+
+Filter availability zones upfront to only those that support all required instance types. Replaces invalid AZs with valid alternatives in the same region before any provisioning attempt. Supported backends: AWS, GCE.
+
+**default:** True
+
+**type:** bool
+
+
+## **pre_flight_capacity_probe** / SCT_PRE_FLIGHT_CAPACITY_PROBE
+
+Before provisioning, probe capacity by launching and terminating one on-demand instance per dynamic type (`instance_type_db_target`, `nemesis_grow_shrink_instance_type`) in the chosen AZ. On capacity errors, raise to trigger AZ/region fallback. Costs ~1 min per type. AWS-only.
 
 **default:** N/A
 

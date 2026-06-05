@@ -55,6 +55,8 @@ DatabaseLogEvent.DATABASE_ERROR: ERROR
 DatabaseLogEvent.STACKTRACE: ERROR
 DatabaseLogEvent.RAFT_TRANSFER_SNAPSHOT_ERROR: WARNING
 DatabaseLogEvent.RAFT_TOPOLOGY_SENDING_ERROR: WARNING
+DatabaseLogEvent.TABLET_SPLIT: DEBUG
+DatabaseLogEvent.TABLET_MERGE: DEBUG
 IndexSpecialColumnErrorEvent: ERROR
 CassandraHarryEvent.failure: CRITICAL
 CassandraHarryEvent.error: ERROR
@@ -153,3 +155,4 @@ ScrubValidationErrorEvent: ERROR
 PartitionRowsValidationEvent: CRITICAL
 FailedResultEvent: ERROR
 HDRFileMissed: ERROR
+KernelPanicEvent: CRITICAL

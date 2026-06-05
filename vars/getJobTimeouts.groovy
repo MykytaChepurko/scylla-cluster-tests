@@ -16,7 +16,7 @@ List<Integer> call(Map params, String region){
     fi
 
     if [[ -n "${params.gce_datacenter ? params.gce_datacenter : ''}" ]] ; then
-        export SCT_GCE_DATACENTER=${groovy.json.JsonOutput.toJson(params.gce_datacenter)}
+        export SCT_GCE_DATACENTER='${params.gce_datacenter}'
     fi
 
     if [[ -n "${params.azure_region_name ? params.azure_region_name : ''}" ]] ; then
@@ -51,7 +51,11 @@ List<Integer> call(Map params, String region){
     }
     Integer testStartupTimeout = 20
     Integer testTeardownTimeout = 40
-    Integer collectLogsTimeout = 90
+    // Scale log collection timeout with test duration: base 90 min + 1 min per hour of test.
+    // For a 3-day test (4320 min): max(90, 90 + 72) = 162 minutes.
+    // Can be overridden per-job via params.collect_logs_timeout.
+    Integer collectLogsTimeout = params.collect_logs_timeout ? params.collect_logs_timeout.toInteger()
+        : Math.max(90, 90 + (testDuration / 60).toInteger())
     Integer resourceCleanupTimeout = 30
     Integer sendEmailTimeout = 5
     Integer testRunTimeout = testStartupTimeout + testDuration + testTeardownTimeout

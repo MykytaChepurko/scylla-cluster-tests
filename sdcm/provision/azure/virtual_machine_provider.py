@@ -82,6 +82,11 @@ class VirtualMachineProvider:
                 "network_profile": {
                     "network_interfaces": [{"id": nic_id, "properties": {"deleteOption": "Detach"}}],
                 },
+                "diagnostics_profile": {
+                    "boot_diagnostics": {
+                        "enabled": True,
+                    }
+                },
             }
 
             if self._enable_azure_kms:
@@ -143,7 +148,7 @@ class VirtualMachineProvider:
                 error_to_raise = err
         for definition, poller in pollers:
             try:
-                poller.wait()
+                poller.wait(timeout=900)
                 v_m = self._azure_service.compute.virtual_machines.get(
                     self._resource_group_name, definition.name, expand="instanceView"
                 )

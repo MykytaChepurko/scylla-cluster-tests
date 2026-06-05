@@ -5,7 +5,7 @@ gce_project: '' # empty mean default one, can be overwritten to use different on
 
 gce_image_db: '' # so we can use `scylla_version` as needed
 gce_image_loader: 'https://www.googleapis.com/compute/v1/projects/ubuntu-os-cloud/global/images/family/ubuntu-2404-lts-amd64'
-gce_image_monitor: 'https://www.googleapis.com/compute/v1/projects/scylla-images/global/images/scylladb-monitor-4-14-1-2026-02-25t09-17-49z'
+gce_image_monitor: 'https://www.googleapis.com/compute/v1/projects/scylla-images/global/images/scylladb-monitor-4-15-0-rc0-2026-04-30t01-12-58z'
 
 gce_image_username: 'scylla-test'
 
@@ -39,6 +39,35 @@ backup_bucket_backend: 'gcs'
 use_preinstalled_scylla: true
 
 kms_key_rotation_interval: 60
+
+scylla_network_config:
+- address: listen_address
+  listen_all: false
+  ip_type: ipv4
+  public: false
+  use_dns: false
+  nic: 0
+- address: rpc_address
+  listen_all: false
+  ip_type: ipv4
+  public: false
+  use_dns: false
+  nic: 0
+- address: broadcast_rpc_address
+  ip_type: ipv4
+  public: false
+  use_dns: false
+  nic: 0
+- address: broadcast_address
+  ip_type: ipv4
+  public: false
+  use_dns: false
+  nic: 0
+- address: test_communication
+  ip_type: ipv4
+  public: false
+  use_dns: false
+  nic: 0
 
 # we are using monitor images, see `gce_image_monitor`
 monitor_branch: null

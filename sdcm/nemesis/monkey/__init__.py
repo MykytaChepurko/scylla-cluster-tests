@@ -920,6 +920,17 @@ class ToggleAuditNemesisSyslog(NemesisBaseClass):
         self.runner.disrupt_toggle_audit_syslog()
 
 
+class ToggleAuditRulesNemesisSyslog(NemesisBaseClass):
+    disruptive = True
+    schema_changes = True
+    config_changes = True
+    free_tier_set = True
+    additional_configs = ["configurations/toggle-audit-rules-nemesis.yaml"]
+
+    def disrupt(self):
+        self.runner.disrupt_toggle_audit_rules_syslog()
+
+
 @target_data_nodes
 class BootstrapStreamingErrorNemesis(NemesisBaseClass):
     disruptive = True
@@ -993,3 +1004,11 @@ class KillMVBuildingCoordinator(NemesisBaseClass):
 
     def disrupt(self):
         self.runner.disrupt_kill_mv_building_coordinator()
+
+
+@target_all_nodes
+class SplitMergeTabletsWithAlter(NemesisBaseClass):
+    schema_changes = True
+
+    def disrupt(self):
+        self.runner.disrupt_trigger_split_merge_tablets_with_alter()

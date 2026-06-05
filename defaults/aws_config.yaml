@@ -7,7 +7,7 @@ instance_type_loader: 'c6i.xlarge'
 instance_type_monitor: 't3.large'
 ami_id_loader: 'resolve:ssm:/aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id'
 # manual on updating monitor images see: docs/monitoring-images.md
-ami_id_monitor: 'scylladb-monitor-4-14-1-2026-02-25t09-17-49z'
+ami_id_monitor: 'scylladb-monitor-4-15-0-rc0-2026-04-30t01-12-58z'
 
 availability_zone: 'a'
 root_disk_size_monitor: 50  # GB, remove this field if default disk size should be used
@@ -34,6 +34,8 @@ data_volume_disk_num: 0
 data_volume_disk_type: 'gp2'
 data_volume_disk_size: 500
 data_volume_disk_iops: 10000 # depend on type iops could be 100-16000 for io2|io3 and 3000-16000 for gp3
+
+fallback_to_next_availability_zone: true
 
 kms_key_rotation_interval: 60
 

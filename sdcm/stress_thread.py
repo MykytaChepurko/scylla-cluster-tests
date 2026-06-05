@@ -137,26 +137,55 @@ class CassandraStressThread(DockerBasedStressThread):
         params = get_stress_cmd_params(stress_cmd)
         tag_suffix = "rt" if "fixed threads" in params else "st"
         if "user profile=" in stress_cmd:
-            # Examples:
-            # Write: ops(insert=1)
-            # Read: ops(read=2)
-            # Mixed: ops(insert=1,read=2)
-            # Only standard operations (read and insert) are supported per user profile stress command in this implementation
-            if "insert=" in stress_cmd:
+            has_write, has_read = self._classify_user_profile_ops(stress_cmd)
+            if has_write:
                 self.hdr_tags.append(f"WRITE-{tag_suffix}")
-            elif "read=" in stress_cmd:
+            if has_read:
                 self.hdr_tags.append(f"READ-{tag_suffix}")
-            else:
-                raise ValueError(
-                    "Cannot detect supported stress operation type from the stress command with user profile: %s",
-                    stress_cmd,
-                )
+            if not has_write and not has_read:
+                raise ValueError(f"Cannot detect stress operation type from user profile command: {stress_cmd}")
         elif " mixed " in stress_cmd:
             self.hdr_tags = [f"WRITE-{tag_suffix}", f"READ-{tag_suffix}"]
         elif " read " in stress_cmd:
             self.hdr_tags = [f"READ-{tag_suffix}"]
         else:
             self.hdr_tags = [f"WRITE-{tag_suffix}"]
+
+    WRITE_OP_KEYWORDS = ("insert", "update", "delete", "write")
+    READ_OP_KEYWORDS = ("read", "select", "get", "count", "scan")
+
+    @classmethod
+    def _classify_user_profile_ops(cls, stress_cmd: str) -> tuple[bool, bool]:
+        """Classify user-profile ops(...) operations as write and/or read.
+
+        Parses the ops clause from the stress command (e.g. ``ops'(select_base=3,url_column_update=1)'``)
+        and classifies each operation name using keyword matching.
+        Operations whose names don't match any known keyword are treated as both write and read
+        to avoid silently dropping HDR data.
+
+        Returns:
+            tuple of (has_write, has_read)
+        """
+        has_write = False
+        has_read = False
+        if ops_match := re.search(r"ops['\s]*\(([^)]+)\)", stress_cmd):
+            for op_part in ops_match.group(1).split(","):
+                op_name = op_part.strip().split("=")[0].lower()
+                if any(w in op_name for w in cls.WRITE_OP_KEYWORDS):
+                    has_write = True
+                elif any(r in op_name for r in cls.READ_OP_KEYWORDS):
+                    has_read = True
+                else:
+                    LOGGER.warning("Unknown user-profile operation %r — treating as mixed (write+read)", op_name)
+                    has_write = True
+                    has_read = True
+        else:
+            # Fallback: no ops() clause found — check for legacy patterns
+            if "insert=" in stress_cmd:
+                has_write = True
+            if "read=" in stress_cmd:
+                has_read = True
+        return has_write, has_read
 
     @staticmethod
     def append_no_warmup_to_cmd(stress_cmd):
@@ -346,6 +375,10 @@ class CassandraStressThread(DockerBasedStressThread):
             cmd_runner_name = loader.ip_address
 
             cpu_options = ""
+            jvm_opts = ""
+            if cs_extra_jvm_opts := self.params.get("cs_extra_jvm_opts"):
+                jvm_opts = f" -e JVM_OPTS='{cs_extra_jvm_opts}'"
+                LOGGER.info("Passing JVM_OPTS to cassandra-stress container: %s", cs_extra_jvm_opts)
             cmd_runner = cleanup_context = RemoteDocker(
                 loader,
                 self.docker_image_name,
@@ -356,7 +389,8 @@ class CassandraStressThread(DockerBasedStressThread):
                 f"--label shell_marker={self.shell_marker}"
                 f" --entrypoint /bin/bash"
                 f" -w /"
-                f" -v {remote_hdr_file_name_full_path}:/{remote_hdr_file_name}",
+                f" -v {remote_hdr_file_name_full_path}:/{remote_hdr_file_name}"
+                f"{jvm_opts}",
             )
 
         stress_cmd = self.create_stress_cmd(cmd_runner, keyspace_idx, loader)
@@ -389,6 +423,13 @@ class CassandraStressThread(DockerBasedStressThread):
             hdrh_logger_context = contextlib.nullcontext()
 
         LOGGER.info("Stress command:\n%s", stress_cmd)
+
+        if self.params.get("cs_extra_jvm_opts"):
+            try:
+                env_check = cmd_runner.run("echo JVM_OPTS=$JVM_OPTS", ignore_status=True, verbose=False)
+                LOGGER.info("JVM_OPTS env inside container: %s", env_check.stdout.strip())
+            except Exception:  # noqa: BLE001
+                LOGGER.debug("Could not verify JVM_OPTS inside container", exc_info=True)
 
         tag = f"TAG: loader_idx:{loader_idx}-cpu_idx:{cpu_idx}-keyspace_idx:{keyspace_idx}"
 
@@ -544,6 +585,28 @@ class CassandraStressThread(DockerBasedStressThread):
 
 stress_cmd_get_duration_pattern = re.compile(r"(?:^|[ \n])[-]{0,2}duration[\s=]+([\d]+[hms]+)")
 stress_cmd_get_warmup_pattern = re.compile(r"(?:^|[ \n])[-]{0,2}warmup[\s=]+([\d]+[hms]+)")
+
+
+def extract_gemini_seed(cmd: str) -> int:
+    """Extract --seed value from a gemini command string.
+
+    Accepts both --seed VALUE and --seed=VALUE formats.
+    Returns the seed as an int, or -1 if not found.
+    """
+    seed_match = re.search(r"--seed[= ](\d+)", cmd)
+    return int(seed_match.group(1)) if seed_match else -1
+
+
+def apply_gemini_stress_duration(cmd: str, stress_duration: int) -> str:
+    """Replace or inject --duration in a gemini command with stress_duration (in minutes).
+
+    Handles both space-delimited (--duration 3h), equals-form (--duration=3h), and YAML
+    block-scalar format where --duration appears at the start of the string with no
+    leading space.
+    """
+    if "--duration" in cmd:
+        return re.sub(r"(^|\s)--duration[\s=]+\S+", f"\\1--duration {stress_duration}m", cmd)
+    return cmd + f" --duration {stress_duration}m"
 
 
 def get_timeout_from_stress_cmd(stress_cmd: str) -> int | None:

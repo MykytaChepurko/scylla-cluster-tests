@@ -21,7 +21,7 @@ def call(Map pipelineParams) {
                name: 'backend')
 
             string(defaultValue: "${pipelineParams.get('region', 'eu-west-1')}",
-               description: 'us-east-1|eu-west-1',
+               description: 'Supported: us-east-1 | us-east-2 | us-west-2 | eu-west-1 | eu-west-2 | eu-west-3 | eu-north-1 | eu-central-1 | ca-central-1 | random (randomly select region)',
                name: 'region')
 
             string(defaultValue: "${pipelineParams.get('availability_zone', '')}",
@@ -304,7 +304,7 @@ def call(Map pipelineParams) {
                                                         fi
 
                                                         if [[ -n "${params.gce_datacenter ? params.gce_datacenter : ''}" ]] ; then
-                                                            export SCT_GCE_DATACENTER=${params.gce_datacenter}
+                                                            export SCT_GCE_DATACENTER='${params.gce_datacenter}'
                                                         fi
 
                                                         export SCT_EMAIL_RECIPIENTS="${email_recipients}"

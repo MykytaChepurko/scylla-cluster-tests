@@ -36,7 +36,7 @@ def call(Map pipelineParams) {
                    name: 'xcloud_env')
 
             string(defaultValue: "${pipelineParams.get('region', 'eu-west-1')}",
-               description: 'Supported: us-east-1 | eu-west-1 | eu-west-2 | eu-north-1 | eu-central-1 | us-west-2 | random (randomly select region)',
+               description: 'Supported: us-east-1 | us-east-2 | us-west-2 | eu-west-1 | eu-west-2 | eu-west-3 | eu-north-1 | eu-central-1 | ca-central-1 | random (randomly select region)',
                name: 'region')
             string(defaultValue: "${pipelineParams.get('gce_datacenter', 'us-east1')}",
                    description: 'GCE datacenter',
@@ -108,6 +108,9 @@ def call(Map pipelineParams) {
             string(defaultValue: "${pipelineParams.get('post_behavior_vector_store_nodes', 'destroy')}",
                    description: 'keep|keep-on-failure|destroy',
                    name: 'post_behavior_vector_store_nodes')
+            string(defaultValue: "${pipelineParams.get('n_vector_store_nodes', '')}",
+                   description: 'Number of Vector Search nodes to deploy.',
+                   name: 'n_vector_store_nodes')
 
             // Cluster Reuse
             separator(name: 'CLUSTER_REUSE', sectionHeader: 'Cluster Reuse')
@@ -344,7 +347,7 @@ def call(Map pipelineParams) {
                     script {
                         wrap([$class: 'BuildUser']) {
                             dir('scylla-cluster-tests') {
-                                timeout(time: 30, unit: 'MINUTES') {
+                                timeout(time: params.backend == 'azure' ? 60 : 30, unit: 'MINUTES') {
                                     provisionResources(params, builder.region)
                                     completed_stages['provision_resources'] = true
                                 }

@@ -20,6 +20,8 @@ import time
 from contextlib import nullcontext
 from datetime import timedelta
 
+from google.api_core.exceptions import Forbidden
+
 from sdcm import mgmt
 from sdcm.argus_results import (
     send_manager_benchmark_results_to_argus,
@@ -34,6 +36,7 @@ from sdcm.mgmt.common import (
     reconfigure_scylla_manager,
     get_persistent_snapshots,
     get_backup_size,
+    BackupRetentionLockMode,
     ObjectStorageUploadMode,
 )
 from sdcm.provision.helpers.certificate import (
@@ -89,14 +92,14 @@ class ManagerRestoreTests(ManagerTestFunctionsMixIn):
             snapshot_tag = random.choice(list(snapshot_dict.keys()))
             keyspace_name = snapshot_dict[snapshot_tag]["keyspace_name"]
 
-            self.restore_backup_with_task(
+            self.restore_with_manager_task(
                 mgr_cluster=mgr_cluster,
                 snapshot_tag=snapshot_tag,
                 timeout=180,
                 restore_schema=True,
                 location_list=location_list,
             )
-            self.restore_backup_with_task(
+            self.restore_with_manager_task(
                 mgr_cluster=mgr_cluster,
                 snapshot_tag=snapshot_tag,
                 timeout=expected_timeout,
@@ -111,42 +114,12 @@ class ManagerRestoreTests(ManagerTestFunctionsMixIn):
             read_thread = self.run_stress_thread(stress_cmd=stress, round_robin=False)
             self.verify_stress_thread(read_thread)
 
-    def test_restore_backup_with_task(self, ks_names: list = None):
-        self.log.info("starting test_restore_backup_with_task")
-        mgr_cluster = self.db_cluster.get_cluster_manager()
-        if not ks_names:
-            ks_names = ["keyspace1"]
-        backup_task = mgr_cluster.create_backup_task(
-            location_list=self.locations, keyspace_list=ks_names, method=self.backup_method
-        )
-        backup_task_status = backup_task.wait_and_get_final_status(timeout=1500)
-        assert backup_task_status == TaskStatus.DONE, (
-            f"Backup task ended in {backup_task_status} instead of {TaskStatus.DONE}"
-        )
-        soft_timeout = 36 * 60
-        hard_timeout = 50 * 60
-        with adaptive_timeout(Operations.MGMT_REPAIR, self.db_cluster.data_nodes[0], timeout=soft_timeout):
-            self.verify_backup_success(
-                mgr_cluster=mgr_cluster,
-                backup_task=backup_task,
-                ks_names=ks_names,
-                restore_data_with_task=True,
-                timeout=hard_timeout,
-            )
-        self.run_verification_read_stress(ks_names)
-        mgr_cluster.delete()  # remove cluster at the end of the test
-        self.log.info("finishing test_restore_backup_with_task")
-
     def test_restore_alternator_backup_with_task(self, delete_tables: list = None):
         self.log.info("starting test_restore_alternator_backup_with_task")
         mgr_cluster = self.db_cluster.get_cluster_manager(
             alternator_credentials=self.alternator.get_credentials(node=self.db_cluster.nodes[0])
         )
-        backup_task = mgr_cluster.create_backup_task(location_list=self.locations, method=self.backup_method)
-        backup_task_status = backup_task.wait_and_get_final_status(timeout=1500)
-        assert backup_task_status == TaskStatus.DONE, (
-            f"Backup task ended in {backup_task_status} instead of {TaskStatus.DONE}"
-        )
+        backup_task = self.backup_with_manager_task(mgr_cluster)
         soft_timeout = 36 * 60
         hard_timeout = 50 * 60
         with adaptive_timeout(Operations.MGMT_REPAIR, self.db_cluster.data_nodes[0], timeout=soft_timeout):
@@ -158,36 +131,67 @@ class ManagerRestoreTests(ManagerTestFunctionsMixIn):
 
 
 class ManagerBackupTests(ManagerRestoreTests):
-    def test_backup_and_restore(self, restore_with_task: bool = True, ks_names: list = None):
-        self.log.info(f"starting test_backup_and_restore[restore_with_task={restore_with_task}]")
+    def test_backup_and_restore(self):
+        self.log.info("starting test_backup_and_restore")
         mgr_cluster = self.db_cluster.get_cluster_manager()
-        backup_task = mgr_cluster.create_backup_task(location_list=self.locations, method=self.backup_method)
-        backup_task_status = backup_task.wait_and_get_final_status(timeout=1500)
-        assert backup_task_status == TaskStatus.DONE, (
-            f"Backup task ended in {backup_task_status} instead of {TaskStatus.DONE}"
-        )
-        self.verify_backup_success(
+
+        backup_task = self.backup_with_manager_task(mgr_cluster)
+        snapshot_tag = backup_task.get_snapshot_tag()
+
+        for ks in self.db_cluster.get_test_keyspaces():
+            self.db_cluster.nodes[0].run_cqlsh(f"DROP KEYSPACE IF EXISTS {ks}")
+
+        self.restore_with_manager_task(
             mgr_cluster=mgr_cluster,
-            backup_task=backup_task,
-            ks_names=ks_names,
-            restore_data_with_task=restore_with_task,
+            snapshot_tag=snapshot_tag,
+            restore_schema=True,
         )
-        self.run_verification_read_stress(ks_names)
+        self.restore_with_manager_task(
+            mgr_cluster=mgr_cluster,
+            snapshot_tag=snapshot_tag,
+            restore_data=True,
+        )
+
+        self.run_verification_read_stress()
         mgr_cluster.delete()  # remove cluster at the end of the test
-        self.log.info(f"finishing test_backup_and_restore[restore_with_task={restore_with_task}]")
+        self.log.info("finishing test_backup_and_restore")
+
+    def test_backup_and_restore_without_manager(self):
+        self.log.info("starting test_backup_and_restore_without_manager")
+        mgr_cluster = self.db_cluster.get_cluster_manager()
+
+        backup_task = self.backup_with_manager_task(mgr_cluster)
+
+        ks_tables_map = self.get_ks_tables_map()
+        self.truncate_tables(ks_tables_map=ks_tables_map)
+        self.restore_with_nodetool_refresh(
+            mgr_cluster=mgr_cluster,
+            snapshot_tag=backup_task.get_snapshot_tag(),
+            ks_tables_map=ks_tables_map,
+        )
+
+        self.run_verification_read_stress()
+        mgr_cluster.delete()  # remove cluster at the end of the test
+        self.log.info("finishing test_backup_and_restore_without_manager")
 
     def test_backup_multiple_ks_tables(self):
         self.log.info("starting test_backup_multiple_ks_tables")
         mgr_cluster = self.db_cluster.get_cluster_manager()
+
         tables = self.create_ks_and_tables(10, 100)
         self.log.debug("tables list = {}".format(tables))
         # TODO: insert data to those tables
-        backup_task = mgr_cluster.create_backup_task(location_list=self.locations, method=self.backup_method)
-        backup_task_status = backup_task.wait_and_get_final_status(timeout=1500)
-        assert backup_task_status == TaskStatus.DONE, (
-            f"Backup task ended in {backup_task_status} instead of {TaskStatus.DONE}"
+
+        backup_task = self.backup_with_manager_task(mgr_cluster)
+
+        ks_tables_map = self.get_ks_tables_map()
+        self.truncate_tables(ks_tables_map=ks_tables_map)
+        self.restore_with_nodetool_refresh(
+            mgr_cluster=mgr_cluster,
+            snapshot_tag=backup_task.get_snapshot_tag(),
+            ks_tables_map=ks_tables_map,
         )
-        self.verify_backup_success(mgr_cluster=mgr_cluster, backup_task=backup_task)
+
         self.log.info("finishing test_backup_multiple_ks_tables")
 
     def test_backup_location_with_path(self):
@@ -204,18 +208,22 @@ class ManagerBackupTests(ManagerRestoreTests):
     def test_backup_rate_limit(self):
         self.log.info("starting test_backup_rate_limit")
         mgr_cluster = self.db_cluster.get_cluster_manager()
+
         rate_limit_list = [f"{dc}:{random.randint(15, 25)}" for dc in self.get_all_dcs_names()]
         self.log.info("rate limit will be {}".format(rate_limit_list))
-        backup_task = mgr_cluster.create_backup_task(
-            location_list=self.locations, rate_limit_list=rate_limit_list, method=self.backup_method
-        )
-        task_status = backup_task.wait_and_get_final_status(timeout=18000)
-        assert task_status == TaskStatus.DONE, (
-            f"Task {backup_task.id} did not end successfully:\n{backup_task.detailed_progress}"
-        )
-        self.log.info("backup task finished with status {}".format(task_status))
+
+        backup_task = self.backup_with_manager_task(mgr_cluster, timeout=18000, rate_limit_list=rate_limit_list)
+        self.log.info("backup task finished with status {}".format(backup_task.status))
         # TODO: verify that the rate limit is as set in the cmd
-        self.verify_backup_success(mgr_cluster=mgr_cluster, backup_task=backup_task)
+
+        ks_tables_map = self.get_ks_tables_map()
+        self.truncate_tables(ks_tables_map=ks_tables_map)
+        self.restore_with_nodetool_refresh(
+            mgr_cluster=mgr_cluster,
+            snapshot_tag=backup_task.get_snapshot_tag(),
+            ks_tables_map=ks_tables_map,
+        )
+
         self.log.info("finishing test_backup_rate_limit")
 
     def test_backup_purge_removes_orphan_files(self):
@@ -309,13 +317,7 @@ class ManagerBackupTests(ManagerRestoreTests):
 
         self.log.info("starting test_enospc_before_restore")
         mgr_cluster = self.db_cluster.get_cluster_manager()
-        backup_task = mgr_cluster.create_backup_task(
-            location_list=self.locations, keyspace_list=["keyspace1"], method=self.backup_method
-        )
-        backup_task_status = backup_task.wait_and_get_final_status(timeout=1500)
-        assert backup_task_status == TaskStatus.DONE, (
-            f"Backup task ended in {backup_task_status} instead of {TaskStatus.DONE}"
-        )
+        backup_task = self.backup_with_manager_task(mgr_cluster, keyspace_list=["keyspace1"])
         target_node = self.db_cluster.nodes[1]
         with ignore_no_space_errors(node=target_node), ignore_stream_mutation_fragments_errors():
             try:
@@ -335,6 +337,57 @@ class ManagerBackupTests(ManagerRestoreTests):
                 clean_enospc_on_node(target_node=target_node, sleep_time=30)
         self.log.info("finishing test_enospc_before_restore")
 
+    def test_worm_backup(self):
+        self.log.info("starting test_worm_backup")
+        mgr_cluster = self.db_cluster.get_cluster_manager()
+
+        self.log.info("Create WORM backup bucket")
+        worm_bucket_name = f"manager-worm-backup-test-{self.test_id[:8]}"
+        location = f"gcs:{worm_bucket_name}"
+        worm_bucket = self.create_worm_bucket(region=self.params.gce_datacenters[0], bucket_name=worm_bucket_name)
+
+        try:
+            self.log.info("Wait 30s for backup location accessibility after bucket creation")
+            # We tried to use `scylla-manager-agent check-location` here instead of dummy sleep, but the approach
+            # turned out to be not stable enough - check-location could proceed while the follow-up sctool backup
+            # could fail immediately due to bucket access issue. The reason - check-location command issued in test
+            # initializes rclone from scratch with fresh tokens, while backup runs through the SM agent server may
+            # hold stale tokens. A fixed sleep is the most robust approach here.
+            time.sleep(30)
+
+            self.log.info("Create backup task and wait for its completion")
+            backup_task = mgr_cluster.create_backup_task(
+                location_list=[location],
+                method=self.backup_method,
+                retention_days=1,
+                retention_lock_mode=BackupRetentionLockMode.UNLOCKED,
+            )
+            task_status = backup_task.wait_and_get_final_status(timeout=1500)
+            assert task_status == TaskStatus.DONE, f"Backup task ended in {task_status} instead of {TaskStatus.DONE}"
+
+            snapshot_files = self.get_all_snapshot_files(
+                cluster_id=mgr_cluster.id,
+                bucket_location=worm_bucket_name,
+                only_sstables=False,
+            )
+            assert snapshot_files, "No snapshot files found after backup"
+
+            self.log.info("Try to delete locked backup files")
+            for file_path in snapshot_files:
+                blob = worm_bucket.blob(file_path)
+                try:
+                    blob.delete()
+                    raise AssertionError(f"Deletion of locked file {file_path} unexpectedly succeeded")
+                except Forbidden:
+                    self.log.debug("File %s is properly locked (deletion forbidden)", file_path)
+            self.log.info("All snapshot files are properly protected by object lock")
+
+        finally:
+            self.destroy_worm_bucket(bucket=worm_bucket)
+            mgr_cluster.delete()
+
+        self.log.info("finishing test_worm_backup")
+
     def test_backup_feature(self):
         self.generate_load_and_wait_for_results()
         with self.subTest("Backup Multiple KS' and Tables"):
@@ -345,8 +398,10 @@ class ManagerBackupTests(ManagerRestoreTests):
             self.test_backup_rate_limit()
         with self.subTest("Test Backup Purge Removes Orphans Files"):
             self.test_backup_purge_removes_orphan_files()
-        with self.subTest("Test restore a backup with restore task"):
-            self.test_restore_backup_with_task()
+        if self.params.get("cluster_backend") == "gce":
+            # WORM backup feature is currently available for GCP only
+            with self.subTest("Test WORM backup with object lock"):
+                self.test_worm_backup()
         with self.subTest("Test Backup end of space"):  # Preferably at the end
             self.test_enospc_during_backup()
         with self.subTest("Test Restore end of space"):
@@ -393,26 +448,22 @@ class ManagerBackupTests(ManagerRestoreTests):
         mgr_cluster = self.db_cluster.get_cluster_manager(force_add=True)
 
         self.log.info("Run backup #1")
-        backup_task_1 = mgr_cluster.create_backup_task(location_list=self.locations, method=self.backup_method)
-        backup_task_1_status = backup_task_1.wait_and_get_final_status(timeout=3600)
-        assert backup_task_1_status == TaskStatus.DONE, (
-            f"Backup task ended in {backup_task_1_status} instead of {TaskStatus.DONE}"
-        )
+        backup_task_1 = self.backup_with_manager_task(mgr_cluster, timeout=3600)
         self.log.info(f"Backup task #1 duration - {backup_task_1.duration}")
 
         self.log.info("Run backup #2")
-        backup_task_2 = mgr_cluster.create_backup_task(location_list=self.locations, method=self.backup_method)
-        backup_task_2_status = backup_task_2.wait_and_get_final_status(timeout=60)
-        assert backup_task_2_status == TaskStatus.DONE, (
-            f"Backup task ended in {backup_task_2_status} instead of {TaskStatus.DONE}"
-        )
+        backup_task_2 = self.backup_with_manager_task(mgr_cluster, timeout=60)
         self.log.info(f"Backup task #2 duration - {backup_task_2.duration}")
 
         assert backup_task_2.duration < timedelta(seconds=15), "No-delta backup took more than 15 seconds"
 
         self.log.info("Verify restore from backup #2")
-        self.verify_backup_success(
-            mgr_cluster=mgr_cluster, backup_task=backup_task_2, restore_data_with_task=True, timeout=3600
+        self.truncate_tables()
+        self.restore_with_manager_task(
+            mgr_cluster=mgr_cluster,
+            snapshot_tag=backup_task_2.get_snapshot_tag(),
+            restore_data=True,
+            timeout=3600,
         )
 
         self.log.info("Run verification read stress")
@@ -506,7 +557,9 @@ class ManagerRepairTests(ManagerTestFunctionsMixIn):
         rf = self.get_rf_based_on_nodes_number() if self.db_node.test_config.MULTI_REGION else 3
         self.create_keyspace_and_basic_table(self.NETWORKSTRATEGY_KEYSPACE_NAME, replication_factor=rf)
 
-        self.create_keyspace_and_basic_table(self.LOCALSTRATEGY_KEYSPACE_NAME, replication_factor=0)
+        self.create_keyspace_and_basic_table(
+            self.LOCALSTRATEGY_KEYSPACE_NAME, replication_factor=0, tablets_config=TabletsConfiguration(enabled=False)
+        )
         repair_task = mgr_cluster.create_repair_task()
         task_final_status = repair_task.wait_and_get_final_status(timeout=7200)
         assert task_final_status == TaskStatus.DONE, "Task: {} final status is: {}.".format(
@@ -707,6 +760,7 @@ class ManagerEncryptionTests(ManagerTestFunctionsMixIn):
             node.remoter.sudo(f"mkdir -p {SCYLLA_SSL_CONF_DIR}")
             node.remoter.send_files(src=f"{ssl_dir}/", dst="/tmp/ssl_conf_tmp/")
             node.remoter.sudo(f"cp -r /tmp/ssl_conf_tmp/. {SCYLLA_SSL_CONF_DIR}/")
+            node.remoter.sudo(f"chown -R scylla:scylla {SCYLLA_SSL_CONF_DIR}")
             node.remoter.run("rm -rf /tmp/ssl_conf_tmp/")
 
         for node in self.db_cluster.nodes:
@@ -925,12 +979,8 @@ class ManagerHelperTests(ManagerTestFunctionsMixIn):
         self.run_and_verify_stress_in_threads(cs_cmds=cs_write_cmds, stop_on_failure=True)
 
         self.log.info("Run backup and wait for it to finish")
-        backup_task = mgr_cluster.create_backup_task(
-            location_list=location_list, rate_limit_list=["0"], method=self.backup_method
-        )
-        backup_task_status = backup_task.wait_and_get_final_status(timeout=200000)
-        assert backup_task_status == TaskStatus.DONE, (
-            f"Backup task ended in {backup_task_status} instead of {TaskStatus.DONE}"
+        backup_task = self.backup_with_manager_task(
+            mgr_cluster, timeout=200000, location_list=location_list, rate_limit_list=["0"]
         )
 
         if is_cloud_manager:
@@ -980,7 +1030,7 @@ class ManagerSanityTests(
     ManagerSuspendTests,
     ManagerEncryptionTests,
 ):
-    def test_manager_sanity(self, prepared_ks: bool = False, ks_names: list = None):
+    def test_manager_sanity(self, prepared_ks: bool = False):
         """
         Test steps:
         1) Generate load (unless keyspaces are pre-created via prepared_ks).
@@ -1000,9 +1050,9 @@ class ManagerSanityTests(
 
         if not is_multi_dc_cluster:
             with self.subTest("Backup and restore (via nodetool refresh, out of Manager) test"):
-                self.test_backup_and_restore(restore_with_task=False, ks_names=ks_names)
+                self.test_backup_and_restore_without_manager()
         with self.subTest("Backup and restore (via Manager task) test"):
-            self.test_backup_and_restore(restore_with_task=True, ks_names=ks_names)
+            self.test_backup_and_restore()
         with self.subTest("Repair multiple keyspace types test"):
             self.test_repair_multiple_keyspace_types()
         with self.subTest("Manager cluster CRUD operations test"):
@@ -1028,13 +1078,12 @@ class ManagerSanityTests(
         self.log.info("starting test_manager_sanity_vnodes_tablets_cluster")
 
         ks_config = [("tablets_keyspace", True), ("vnodes_keyspace", False)]
-        ks_names = [i[0] for i in ks_config]
         for ks_name, tablets_enabled in ks_config:
             tablets_config = TabletsConfiguration(enabled=tablets_enabled)
             self.create_keyspace(ks_name, replication_factor=3, tablets_config=tablets_config)
             self.generate_load_and_wait_for_results(keyspace_name=ks_name)
 
-        self.test_manager_sanity(prepared_ks=True, ks_names=ks_names)
+        self.test_manager_sanity(prepared_ks=True)
 
         self.log.info("finishing test_manager_sanity_vnodes_tablets_cluster")
 
@@ -1228,13 +1277,7 @@ class ManagerRestoreBenchmarkTests(ManagerTestFunctionsMixIn):
         manager_tool = mgmt.get_scylla_manager_tool(manager_node=self.monitors.nodes[0])
         mgr_cluster = self.db_cluster.get_cluster_manager()
 
-        backup_task = mgr_cluster.create_backup_task(
-            location_list=self.locations, rate_limit_list=["0"], method=self.backup_method
-        )
-        backup_task_status = backup_task.wait_and_get_final_status(timeout=200000)
-        assert backup_task_status == TaskStatus.DONE, (
-            f"Backup task ended in {backup_task_status} instead of {TaskStatus.DONE}"
-        )
+        backup_task = self.backup_with_manager_task(mgr_cluster, timeout=200000, rate_limit_list=["0"])
         InfoEvent(message=f"The backup task has ended successfully. Backup run time: {backup_task.duration}").publish()
         self.manager_test_metrics.backup_time = backup_task.duration
 
@@ -1244,7 +1287,7 @@ class ManagerRestoreBenchmarkTests(ManagerTestFunctionsMixIn):
             self.db_cluster.nodes[0].run_cqlsh(f"TRUNCATE {ks_name}.standard1")
 
         extra_params = self.get_restore_extra_parameters()
-        task = self.restore_backup_with_task(
+        task = self.restore_with_manager_task(
             mgr_cluster=mgr_cluster,
             snapshot_tag=backup_task.get_snapshot_tag(),
             timeout=110000,
@@ -1297,7 +1340,7 @@ class ManagerRestoreBenchmarkTests(ManagerTestFunctionsMixIn):
             self.db_cluster.nodes[0].run_cqlsh(cmd="grant scylla_admin to scylla_manager")
 
         self.log.info("Restoring the schema")
-        self.restore_backup_with_task(
+        self.restore_with_manager_task(
             mgr_cluster=mgr_cluster,
             snapshot_tag=snapshot_data.tag,
             timeout=600,
@@ -1308,10 +1351,10 @@ class ManagerRestoreBenchmarkTests(ManagerTestFunctionsMixIn):
         if restore_outside_manager:
             self.log.info("Restoring the data outside the Manager")
             with ExecutionTimer() as timer:
-                self.restore_backup_without_manager(
+                self.restore_with_nodetool_refresh(
                     mgr_cluster=mgr_cluster,
                     snapshot_tag=snapshot_data.tag,
-                    ks_tables_list=snapshot_data.ks_tables_map,
+                    ks_tables_map=snapshot_data.ks_tables_map,
                     location=locations[0],
                     precreated_backup=True,
                 )
@@ -1319,7 +1362,7 @@ class ManagerRestoreBenchmarkTests(ManagerTestFunctionsMixIn):
         else:
             self.log.info("Restoring the data")
             extra_params = self.get_restore_extra_parameters()
-            task = self.restore_backup_with_task(
+            task = self.restore_with_manager_task(
                 mgr_cluster=mgr_cluster,
                 snapshot_tag=snapshot_data.tag,
                 restore_data=True,

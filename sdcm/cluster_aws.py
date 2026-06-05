@@ -43,7 +43,6 @@ from sdcm.provision.network_configuration import (
 )
 from sdcm.provision.scylla_yaml import SeedProvider
 from sdcm.provision.helpers.cloud_init import wait_cloud_init_completes
-from sdcm.reporting.tooling_reporter import VectorStoreVersionReporter
 from sdcm.sct_provision.aws.cluster import PlacementGroup
 
 from sdcm.remote import LocalCmdRunner, shell_script_cmd, NETWORK_EXCEPTIONS
@@ -52,6 +51,7 @@ from sdcm.sct_events.filters import DbEventsFilter
 from sdcm.sct_events.system import SpotTerminationEvent
 from sdcm.utils.aws_utils import tags_as_ec2_tags, ec2_instance_wait_public_ip
 from sdcm.utils.common import list_instances_aws
+from sdcm.kernel_panic_checker import AWSKernelPanicChecker
 from sdcm.utils.decorators import retrying
 from sdcm.nemesis.utils.node_allocator import mark_new_nodes_as_running_nemesis
 from sdcm.utils.net import to_inet_ntop_format
@@ -432,17 +432,32 @@ class AWSCluster(cluster.BaseCluster):
         test_id = self.test_config.test_id()
         if not test_id:
             raise ValueError("test_id should be configured for using reuse_cluster")
-        availability_zone = self.params.get("availability_zone").split(",")[az_idx] if az_idx is not None else None
         ec2 = ec2_client.EC2ClientWrapper(region_name=self.region_names[dc_idx])
+        region_name = self.region_names[dc_idx]
         results = list_instances_aws(
             tags_dict={"TestId": test_id, "NodeType": self.node_type},
             running=True,
-            region_name=self.region_names[dc_idx],
+            region_name=region_name,
             group_as_region=True,
-            availability_zone=availability_zone,
             verbose=True,
         )
-        instances = results[self.region_names[dc_idx]]
+        instances = results[region_name]
+
+        if az_idx is not None and instances:
+            # bucket by actual AZ letter so instances can be found even if provisioning
+            # moved them away from params["availability_zone"] (AZ fallback flow)
+            by_az = {}
+            for instance in instances:
+                by_az.setdefault(instance["Placement"]["AvailabilityZone"][-1], []).append(instance)
+
+            configured_letters = [
+                letter.strip() for letter in (self.params.get("availability_zone") or "").split(",") if letter.strip()
+            ]
+            ordered_letters = configured_letters + sorted(
+                letter for letter in by_az if letter not in configured_letters
+            )
+            ordered_letters = [letter for letter in ordered_letters if letter in by_az]
+            instances = by_az[ordered_letters[az_idx]] if az_idx < len(ordered_letters) else []
 
         def sort_by_index(item):
             for tag in item["Tags"]:
@@ -730,6 +745,15 @@ class AWSNode(cluster.BaseNode):
         for tag in self._instance.tags:
             if tag["Key"] == "ZeroTokenNode" and tag["Value"] == "True":
                 self._is_zero_token_node = True
+
+    def _create_kernel_panic_checker(self):
+        return AWSKernelPanicChecker(
+            node_name=self.name,
+            instance_id=self._instance.id,
+            region=self._ec2_service.meta.client.meta.region_name,
+            host=self.external_address,
+            logdir=self.logdir,
+        )
 
     def wait_for_cloud_init(self):
         self.remoter.is_up(timeout=300)
@@ -1422,6 +1446,7 @@ class VectorStoreAWSNode(VectorStoreNodeMixin, AWSNode):
         base_logdir=None,
         dc_idx=0,
         rack=0,
+        after_config=None,
     ):
         super().__init__(
             ec2_instance=ec2_instance,
@@ -1434,6 +1459,7 @@ class VectorStoreAWSNode(VectorStoreNodeMixin, AWSNode):
             base_logdir=base_logdir,
             dc_idx=dc_idx,
             rack=rack,
+            after_config=after_config,
         )
 
     def init(self):
@@ -1455,12 +1481,6 @@ class VectorStoreAWSNode(VectorStoreNodeMixin, AWSNode):
             f"sudo chown {self.parent_cluster.params.get('ami_vector_store_user')}: /home/ubuntu/vector-store/.env",
             verbose=True,
         )
-        try:
-            VectorStoreVersionReporter(
-                self.remoter, "/opt/vector-store/vector-store", self.test_config.argus_client()
-            ).report()
-        except Exception:  # noqa: BLE001
-            LOGGER.warning("Error submitting vector store version, VS package won't show in Argus.", exc_info=True)
 
 
 class VectorStoreSetAWS(VectorStoreClusterMixin, AWSCluster):
@@ -1519,7 +1539,9 @@ class VectorStoreSetAWS(VectorStoreClusterMixin, AWSCluster):
                 self.log.error("Failed to reconfigure Vector Store node %s: %s", node.name, e)
                 raise
 
-    def _create_node(self, instance, ami_username, node_prefix, node_index, base_logdir, dc_idx, rack):
+    def _create_node(
+        self, instance, ami_username, node_prefix, node_index, base_logdir, dc_idx, rack, after_config=None
+    ):
         ec2_service = self._ec2_services[0 if self.params.get("simulated_regions") else dc_idx]
         credentials = self._credentials[0 if self.params.get("simulated_regions") else dc_idx]
         node = VectorStoreAWSNode(
@@ -1533,6 +1555,7 @@ class VectorStoreSetAWS(VectorStoreClusterMixin, AWSCluster):
             base_logdir=base_logdir,
             dc_idx=dc_idx,
             rack=rack,
+            after_config=after_config,
         )
         node.init()
         return node

@@ -2,10 +2,7 @@
 
 def call(Map params, String region){
     def current_region = initAwsRegionParam(params.region, region)
-    def current_gce_datacenter = ""
-    if (params.gce_datacenter) {
-        current_gce_datacenter = groovy.json.JsonOutput.toJson(params.gce_datacenter)
-    }
+    def current_gce_datacenter = params.gce_datacenter ?: ""
     def current_oci_region = ""
     if (params.oci_region_name) {
         current_oci_region = initAwsRegionParam(params.oci_region_name, region)
@@ -38,7 +35,7 @@ def call(Map params, String region){
         export SCT_REGION_NAME=${current_region}
     fi
     if [[ -n "${params.gce_datacenter ? params.gce_datacenter : ''}" ]] ; then
-        export SCT_GCE_DATACENTER=${current_gce_datacenter}
+        export SCT_GCE_DATACENTER='${current_gce_datacenter}'
     fi
     if [[ -n "${params.azure_region_name ? params.azure_region_name : ''}" ]] ; then
         export SCT_AZURE_REGION_NAME=${params.azure_region_name}
@@ -60,6 +57,9 @@ def call(Map params, String region){
     fi
     if [[ -n "${params.post_behavior_vector_store_nodes ? params.post_behavior_vector_store_nodes : ''}" ]] ; then
         export SCT_POST_BEHAVIOR_VECTOR_STORE_NODES="${params.post_behavior_vector_store_nodes}"
+    fi
+    if [[ -n "${params.n_vector_store_nodes ? params.n_vector_store_nodes : ''}" ]] ; then
+        export SCT_N_VECTOR_STORE_NODES="${params.n_vector_store_nodes}"
     fi
 
     echo "Starting to clean resources ..."

@@ -52,7 +52,6 @@ from sdcm.sct_events.database import (
 )
 from sdcm.sct_events.filters import DbEventsFilter
 from sdcm.sct_events.group_common_events import (
-    critical_host_maintenance_migration,
     decorate_with_context,
     ignore_abort_requested_errors,
     ignore_upgrade_schema_errors,
@@ -314,13 +313,11 @@ class UpgradeTest(FillDatabaseData, loader_utils.LoaderUtilsMixin):
 
             orig_is_enterprise = node.is_product_enterprise
             if node.distro.is_rhel_like:
-                result = node.remoter.run("sudo yum search scylla-enterprise 2>&1", ignore_status=True)
-                new_is_enterprise = bool(
-                    "scylla-enterprise.x86_64" in result.stdout or "No matches found" not in result.stdout
-                )
+                result = node.remoter.run("sudo yum search scylla-enterprise-server 2>&1", ignore_status=True)
+                new_is_enterprise = "scylla-enterprise-server" in result.stdout
             else:
-                result = node.remoter.run("sudo apt-cache search scylla-enterprise", ignore_status=True)
-                new_is_enterprise = "scylla-enterprise" in result.stdout
+                result = node.remoter.run("sudo apt-cache search scylla-enterprise-server", ignore_status=True)
+                new_is_enterprise = "scylla-enterprise-server" in result.stdout
 
             scylla_pkg = "scylla-enterprise" if new_is_enterprise else "scylla"
             ver_suffix = r"\*{}".format(new_version) if new_version else ""
@@ -377,8 +374,45 @@ class UpgradeTest(FillDatabaseData, loader_utils.LoaderUtilsMixin):
         if upgrade_sstables:
             self.upgradesstables_if_command_available(node)
 
+        self._verify_node_exporter_after_upgrade(node)
+
         self.db_cluster.wait_all_nodes_un()
         self.actions_log.info(f"Upgrade {node.name} node completed")
+
+    def _verify_node_exporter_after_upgrade(self, node):
+        """Verify scylla-node-exporter service runs the binary shipped by the installed package."""
+        with self.actions_log.action_scope("verify_node_exporter"):
+            # Check the service is active
+            result = node.remoter.run("systemctl is-active scylla-node-exporter", ignore_status=True)
+            assert result.ok, f"scylla-node-exporter service is NOT active on {node.name}"
+            self.log.info("scylla-node-exporter service is active on %s", node.name)
+
+            # Get the ExecStart binary path from the systemd unit
+            result = node.remoter.run(
+                r"systemctl show scylla-node-exporter -p ExecStart --value | grep -oP 'path=\K[^;\s]+'",
+            )
+            service_binary = result.stdout.strip()
+            self.log.info("scylla-node-exporter ExecStart binary on %s: %s", node.name, service_binary)
+            assert service_binary, f"Could not determine ExecStart binary for scylla-node-exporter on {node.name}"
+
+            # Verify the binary is owned by the scylla-node-exporter package
+            if node.distro.is_rhel_like or node.distro.is_sles:
+                pkg_result = node.remoter.run(f"rpm -qf {service_binary}", ignore_status=True)
+            else:
+                pkg_result = node.remoter.run(f"dpkg -S {service_binary}", ignore_status=True)
+            assert pkg_result.ok and "scylla-node-exporter" in pkg_result.stdout, (
+                f"Binary {service_binary} on {node.name} is NOT owned by scylla-node-exporter package. "
+                f"Output: {pkg_result.stdout.strip()}"
+            )
+            self.log.info(
+                "Confirmed %s is owned by scylla-node-exporter package on %s",
+                service_binary,
+                node.name,
+            )
+
+            # Log the binary version for reference
+            result = node.remoter.run(f"{service_binary} --version 2>&1 | head -1")
+            self.log.info("node_exporter binary version on %s: %s", node.name, result.stdout.strip())
 
     def upgrade_os(self, nodes):
         def upgrade(node):
@@ -829,13 +863,12 @@ class UpgradeTest(FillDatabaseData, loader_utils.LoaderUtilsMixin):
         with ignore_upgrade_schema_errors():
             step = "Step5 - Upgrade rest of the Nodes "
             self.actions_log.info(step)
-            with critical_host_maintenance_migration():
-                for i in indexes[1:]:
-                    self.db_cluster.node_to_upgrade = self.db_cluster.nodes[i]
-                    self.upgrade_node(self.db_cluster.node_to_upgrade)
-                    self.db_cluster.node_to_upgrade.check_node_health()
-                    self.fill_and_verify_db_data("after upgraded %s" % self.db_cluster.node_to_upgrade.name)
-                    self.search_for_idx_token_error_after_upgrade(node=self.db_cluster.node_to_upgrade, step=step)
+            for i in indexes[1:]:
+                self.db_cluster.node_to_upgrade = self.db_cluster.nodes[i]
+                self.upgrade_node(self.db_cluster.node_to_upgrade)
+                self.db_cluster.node_to_upgrade.check_node_health()
+                self.fill_and_verify_db_data("after upgraded %s" % self.db_cluster.node_to_upgrade.name)
+                self.search_for_idx_token_error_after_upgrade(node=self.db_cluster.node_to_upgrade, step=step)
         self.actions_log.info("Step5.1 - run raft topology upgrade procedure")
         self.run_raft_topology_upgrade_procedure()
         InfoEvent(message="Step5.2 - check limited voters feature").publish()
@@ -1100,9 +1133,8 @@ class UpgradeTest(FillDatabaseData, loader_utils.LoaderUtilsMixin):
 
         # Upgrade all nodes
         self.actions_log.info("Upgrade nodes")
-        with critical_host_maintenance_migration():
-            for node_to_upgrade in nodes_to_upgrade:
-                self._start_and_wait_for_node_upgrade(node_to_upgrade, step=next(step))
+        for node_to_upgrade in nodes_to_upgrade:
+            self._start_and_wait_for_node_upgrade(node_to_upgrade, step=next(step))
         self.actions_log.info("All nodes were upgraded successfully")
 
         self.actions_log.info("Run raft topology upgrade procedure")

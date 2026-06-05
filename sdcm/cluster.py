@@ -54,7 +54,7 @@ from invoke.runners import Result
 from cassandra import ConsistencyLevel, DriverException
 from cassandra.auth import PlainTextAuthProvider
 from cassandra.cluster import Cluster as ClusterDriver
-from cassandra.cluster import NoHostAvailable, ConnectionShutdown
+from cassandra.cluster import NoHostAvailable, ConnectionShutdown, ControlConnectionQueryFallback
 from cassandra.policies import RetryPolicy
 from cassandra.policies import WhiteListRoundRobinPolicy, RackAwareRoundRobinPolicy, LoadBalancingPolicy
 from cassandra.query import SimpleStatement
@@ -455,6 +455,7 @@ class BaseNode(AutoSshContainerMixin):
         self.stop_wait_db_up_event = threading.Event()
         self.lock = threading.Lock()
 
+        self.kernel_panic_checker = None
         self.running_nemesis = None
 
         # We should disable bootstrap when we create nodes to establish the cluster,
@@ -598,6 +599,25 @@ class BaseNode(AutoSshContainerMixin):
                         "Encountered an unhadled exception while changing 'perf_event_paranoid' value", exc_info=True
                     )
         self._add_node_to_argus()
+        self._start_kernel_panic_checker()
+
+    def _create_kernel_panic_checker(self):
+        return None
+
+    def _start_kernel_panic_checker(self):
+        if not self.parent_cluster.params.get("enable_kernel_panic_checker"):
+            return
+        self.kernel_panic_checker = self._create_kernel_panic_checker()
+        if self.kernel_panic_checker:
+            self.kernel_panic_checker.start()
+            LOGGER.debug("Started kernel panic monitoring for node %s", self.name)
+
+    def _stop_kernel_panic_checker(self):
+        if self.kernel_panic_checker:
+            LOGGER.debug("Stopping kernel panic monitoring for node %s", self.name)
+            self.kernel_panic_checker.stop()
+            self.kernel_panic_checker.join(timeout=5)
+            self.kernel_panic_checker = None
 
     def _add_node_to_argus(self):
         try:
@@ -1631,6 +1651,7 @@ class BaseNode(AutoSshContainerMixin):
             return None
 
     def destroy(self):
+        self._stop_kernel_panic_checker()
         self.stop_task_threads()
         if self.remoter:
             self.remoter.stop()
@@ -1994,7 +2015,7 @@ class BaseNode(AutoSshContainerMixin):
             ValueError: if the service returns success=false
         """
         response = requests.post(
-            "https://api.backtrace.scylladb.com/api/backtrace",
+            "https://backtrace.scylladb.com/api/backtrace",
             json={"build_id": build_id, "input": "Backtrace:\n" + raw_backtrace},
             timeout=120,
         )
@@ -2393,9 +2414,10 @@ class BaseNode(AutoSshContainerMixin):
                 # Try each HKP keyserver
                 for keyserver in hkp_keyservers:
                     result = self.remoter.sudo(
-                        f"gpg --homedir /tmp --no-default-keyring --keyring {temp_keyring} --keyserver {keyserver} --keyserver-options timeout=10 --recv-keys {apt_key}",
+                        f"timeout 30 gpg --homedir /tmp --no-default-keyring --keyring {temp_keyring} --keyserver {keyserver} --keyserver-options timeout=10 --recv-keys {apt_key}",
                         retry=1,
                         ignore_status=True,
+                        timeout=120,
                     )
                     if result.ok:
                         LOGGER.debug("Fetched GPG key %s from %s", apt_key, keyserver)
@@ -2411,6 +2433,7 @@ class BaseNode(AutoSshContainerMixin):
                         ),
                         retry=1,
                         ignore_status=True,
+                        timeout=120,
                     )
                     if result.ok:
                         LOGGER.debug("Fetched GPG key %s from HTTPS fallback", apt_key)
@@ -4135,7 +4158,12 @@ class BaseCluster:
                     for idx in range(num):
                         nodes_per_az[idx % azs] += 1
                     for az_index in range(azs):
-                        rack = None if self.params.get("simulated_racks") else az_index
+                        # NOTE: OCI pre-provisioner places VMs using per-node round-robin
+                        #       so rack must be 'None' to let the 'add_nodes' derive it from the 'node_index'.
+                        if self.params.get("simulated_racks") or self.params.get("cluster_backend") == "oci":
+                            rack = None
+                        else:
+                            rack = az_index
                         self.add_nodes(
                             nodes_per_az[az_index], dc_idx=dc_idx, rack=rack, enable_auto_bootstrap=self.auto_bootstrap
                         )
@@ -4145,7 +4173,10 @@ class BaseCluster:
                 for idx in range(n_nodes):
                     nodes_per_az[idx % azs] += 1
                 for az_index in range(azs):
-                    rack = None if self.params.get("simulated_racks") else az_index
+                    if self.params.get("simulated_racks") or self.params.get("cluster_backend") == "oci":
+                        rack = None
+                    else:
+                        rack = az_index
                     self.add_nodes(nodes_per_az[az_index], rack=rack, enable_auto_bootstrap=self.auto_bootstrap)
             else:
                 raise ValueError("Unsupported type: {}".format(type(n_nodes)))
@@ -4240,7 +4271,7 @@ class BaseCluster:
             r"(?P<tokens>[\d]+)\s+"
             r"(?P<owns>[\w?]+)\s+"
             r"(?P<host_id>[\w-]+)\s+"
-            r"(?P<rack>[\w]+|$)"
+            r"(?P<rack>[\w-]+|$)"
         )
 
         for dc in data_centers:
@@ -4483,7 +4514,7 @@ class BaseCluster:
             node.destroy()
 
     def get_db_auth(self):
-        if self.params.get("use_ldap") and self.params.get("are_ldap_users_on_scylla"):
+        if self.params.get("use_ldap") and TestConfig().LDAP_USERS_ON_SCYLLA:
             user = LDAP_USERS[0]
             password = LDAP_PASSWORD
         else:
@@ -4569,6 +4600,10 @@ class BaseCluster:
         self.log.debug("ssl_context: %s", str(ssl_context))
 
         kwargs = dict(contact_points=node_ips, port=port, ssl_context=ssl_context)
+        if self.test_config.IP_SSH_CONNECTIONS == "public":
+            kwargs["allow_control_connection_query_fallback"] = ControlConnectionQueryFallback.SkipPoolCreation
+        elif self.params.get("use_zero_nodes"):
+            kwargs["allow_control_connection_query_fallback"] = ControlConnectionQueryFallback.Fallback
         cluster_driver = ClusterDriver(
             auth_provider=auth_provider,
             compression=compression,
@@ -4852,7 +4887,7 @@ class BaseCluster:
         filter_empty_tables=True,
         filter_by_keyspace: list = None,
         filter_func: Callable[..., bool] = None,
-        filter_out_paxos_tables: bool = False,
+        filter_out_paxos_tables: bool = True,
     ) -> List[str]:
         return self.get_any_ks_cf_list(
             db_node,
@@ -6577,7 +6612,7 @@ class BaseLoaderSet:
         if not self._gemini_version:
             try:
                 result = self.nodes[0].remoter.run(
-                    f"docker run --rm {self.params.get('stress_image.gemini')} gemini --version", ignore_status=True
+                    f"docker run --rm {self.params.get('stress_image.gemini')} --version-json", ignore_status=True
                 )
                 if result.ok:
                     self._gemini_version = get_gemini_version(result.stdout)
@@ -7657,7 +7692,17 @@ class NoMonitorSet:
 
 
 class LocalNode(BaseNode):
-    def __init__(self, name, parent_cluster, ssh_login_info=None, base_logdir=None, node_prefix=None, dc_idx=0, rack=0):
+    def __init__(
+        self,
+        name,
+        parent_cluster,
+        ssh_login_info=None,
+        base_logdir=None,
+        node_prefix=None,
+        dc_idx=0,
+        rack=0,
+        after_config=None,
+    ):
         super().__init__(
             name=name,
             parent_cluster=parent_cluster,
@@ -7666,6 +7711,7 @@ class LocalNode(BaseNode):
             node_prefix=node_prefix,
             dc_idx=dc_idx,
             rack=rack,
+            after_config=after_config,
         )
 
     @property

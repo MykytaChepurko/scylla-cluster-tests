@@ -126,6 +126,13 @@ class VirtualMachineProvider:
                 )
                 pending_instance_creations.append((definition, operation, normalized_name, user_data, startup_script))
             except google.api_core.exceptions.GoogleAPIError as err:
+                if _is_zone_exhausted(err):
+                    LOGGER.error(
+                        "Zone %s resource pool exhausted during insert request for %s",
+                        self.zone,
+                        normalized_name,
+                    )
+                    raise ZoneResourcesExhaustedError(f"Zone {self.zone} resource pool exhausted: {err}") from err
                 LOGGER.error("Error when sending create vm request for instance %s: %s", normalized_name, str(err))
                 error_to_raise = err
 
@@ -136,11 +143,20 @@ class VirtualMachineProvider:
                     definition, operation, normalized_name, pricing_model, user_data, startup_script
                 )
                 instances.append(instance)
+            except ZoneResourcesExhaustedError:
+                # Zone exhaustion is unrecoverable; let it propagate immediately.
+                # Successfully-created instances remain in self._cache so callers
+                # can clean them up before retrying in a different zone.
+                raise
             except google.api_core.exceptions.GoogleAPIError as err:
                 LOGGER.error("Error when waiting for instance %s: %s", normalized_name, str(err))
                 error_to_raise = err
 
         if error_to_raise:
+            if _is_zone_exhausted(error_to_raise):
+                raise ZoneResourcesExhaustedError(
+                    f"Zone {self.zone} resource pool exhausted: {error_to_raise}"
+                ) from error_to_raise
             raise ProvisionError(f"Failed to create instances: {error_to_raise}") from error_to_raise
         return instances
 
@@ -274,6 +290,13 @@ class VirtualMachineProvider:
             instance.scheduling.on_host_maintenance = "TERMINATE"
             instance.scheduling.provisioning_model = compute_v1.Scheduling.ProvisioningModel.SPOT.name
             instance.scheduling.instance_termination_action = "STOP"
+        elif definition.type.startswith("e2-"):
+            # e2 family supports only on_host_maintenance=MIGRATE for non-spot VMs
+            instance.scheduling.on_host_maintenance = "MIGRATE"
+        else:
+            # avoid live migration and unexpected restarts disrupting tests
+            instance.scheduling.on_host_maintenance = "TERMINATE"
+            instance.scheduling.automatic_restart = False
 
         # Network tags and service accounts
         network_tags = self.network_provider.get_network_tags(allow_public_access=definition.use_public_ip)

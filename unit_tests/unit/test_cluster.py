@@ -11,6 +11,8 @@
 #
 # Copyright (c) 2020 ScyllaDB
 
+import importlib
+import inspect
 import logging
 import tempfile
 import time
@@ -20,7 +22,7 @@ from datetime import datetime, timezone
 import pytest
 from invoke import Result
 
-from sdcm.cluster import BaseMonitorSet
+from sdcm.cluster import BaseCluster, BaseMonitorSet, BaseNode
 from sdcm.db_log_reader import DbLogReader
 from sdcm.sct_events.database import SYSTEM_ERROR_EVENTS_PATTERNS
 from sdcm.sct_events.filters import DbEventsFilter
@@ -735,6 +737,54 @@ class TestNodetoolStatus:
             }
         }
 
+    def test_can_get_nodetool_status_oci_hyphenated_rack(self):
+        """OCI rack names contain hyphens (e.g., iad-ad-1). Verify they are parsed fully."""
+        resp = "\n".join(
+            [
+                "Datacenter: iad",
+                "===============",
+                "Status=Up/Down",
+                "|/ State=Normal/Leaving/Joining/Moving",
+                "--  Address      Load       Tokens  Owns    Host ID                               Rack",
+                "UN  10.0.3.109   77.79 GB   256     ?       6367305e-5b28-464c-8f0f-c18094822bbf  iad-ad-1",
+                "UN  10.0.3.112   65.23 GB   256     ?       a1b2c3d4-e5f6-7890-abcd-ef1234567890  iad-ad-2",
+                "UN  10.0.3.130   70.11 GB   256     ?       deadbeef-cafe-babe-dead-beefcafebabe  iad-ad-3",
+            ]
+        )
+        node = NodetoolDummyNode(resp=resp)
+        db_cluster = DummyScyllaCluster([node])
+
+        status = db_cluster.get_nodetool_status()
+
+        assert status == {
+            "iad": {
+                "10.0.3.109": {
+                    "state": "UN",
+                    "load": "77.79GB",
+                    "tokens": "256",
+                    "owns": "?",
+                    "host_id": "6367305e-5b28-464c-8f0f-c18094822bbf",
+                    "rack": "iad-ad-1",
+                },
+                "10.0.3.112": {
+                    "state": "UN",
+                    "load": "65.23GB",
+                    "tokens": "256",
+                    "owns": "?",
+                    "host_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+                    "rack": "iad-ad-2",
+                },
+                "10.0.3.130": {
+                    "state": "UN",
+                    "load": "70.11GB",
+                    "tokens": "256",
+                    "owns": "?",
+                    "host_id": "deadbeef-cafe-babe-dead-beefcafebabe",
+                    "rack": "iad-ad-3",
+                },
+            }
+        }
+
 
 @pytest.mark.parametrize(
     "cat_results,expected_core_number",
@@ -875,3 +925,162 @@ def test_base_node_init_with_none_ssh_login_info():
     node.init()
 
     assert isinstance(node.remoter, LocalCmdRunner), f"Expected LocalCmdRunner, got {type(node.remoter)}"
+
+
+# backend modules whose `BaseNode` subclasses must be loaded into the class hierarchy
+_BACKEND_MODULES = (
+    "sdcm.cluster_aws",
+    "sdcm.cluster_azure",
+    "sdcm.cluster_baremetal",
+    "sdcm.cluster_cloud",
+    "sdcm.cluster_docker",
+    "sdcm.cluster_gce",
+    "sdcm.cluster_k8s",
+    "sdcm.cluster_k8s.eks",
+    "sdcm.cluster_k8s.gke",
+    "sdcm.cluster_k8s.mini_k8s",
+    "sdcm.cluster_oci",
+    "sdcm.utils.docker_remote",
+)
+
+
+def _all_base_node_subclasses() -> list[type]:
+    """Return all `BaseNode` subclasses from the `sdcm` package, excluding test fixtures."""
+    for module_name in _BACKEND_MODULES:
+        importlib.import_module(module_name)
+
+    all_subclasses = set()
+    stack = list(BaseNode.__subclasses__())
+    while stack:
+        cls = stack.pop()
+        if cls not in all_subclasses:
+            all_subclasses.add(cls)
+            stack.extend(cls.__subclasses__())
+
+    production = [cls for cls in all_subclasses if cls.__module__.startswith("sdcm.")]
+    return sorted(production, key=lambda c: c.__name__)
+
+
+# classes that use cloud-SDK clients in __init__ and need those patched out during construction
+_INIT_CONSTRUCT_PATCHES: dict[str, tuple[str, ...]] = {
+    "GCENode": ("sdcm.cluster_gce.GceLoggingClient",),
+}
+
+# `BaseNode.__init__` kwargs a subclass intentionally does NOT accept.
+_NO_SSH = frozenset({"ssh_login_info"})
+_NO_DC_RACK = frozenset({"dc_idx", "rack"})
+_NARROWED_KWARGS: dict[str, frozenset[str]] = {
+    "AWSNode": _NO_SSH,
+    "AzureNode": _NO_SSH,
+    "BasePodContainer": _NO_SSH,
+    "CloudManagerNode": _NO_SSH,
+    "CloudNode": _NO_SSH,
+    "CloudVSNode": _NO_SSH,
+    "GCENode": _NO_SSH,
+    "LoaderPodContainer": _NO_SSH,
+    "OciNode": _NO_SSH,
+    "VectorStoreAWSNode": _NO_SSH,
+    "DockerLoaderNode": _NO_DC_RACK,
+    "DockerMonitoringNode": _NO_DC_RACK,
+    "DockerNode": _NO_DC_RACK,
+    "VectorStoreDockerNode": _NO_DC_RACK,
+    "PhysicalMachineNode": _NO_DC_RACK | _NO_SSH,
+    "RemoteDocker": _NO_DC_RACK | _NO_SSH | frozenset({"base_logdir", "node_prefix"}),
+}
+
+
+def _build_init_kwargs(cls: type) -> dict:
+    """Build the minimal kwargs needed to construct `cls` for this test."""
+    kwargs: dict[str, object] = {}
+    constructor_params = inspect.signature(cls.__init__).parameters
+
+    for name, param in constructor_params.items():
+        if name == "self" or param.default is not inspect.Parameter.empty:
+            continue
+        if name == "cloud_instance_data":
+            kwargs[name] = {}
+            continue
+        if name == "parent_cluster":
+            parent_cluster = unittest.mock.MagicMock(name="parent_cluster")
+            parent_cluster.params = {}
+            kwargs[name] = parent_cluster
+            continue
+        kwargs[name] = unittest.mock.MagicMock(name=name)
+
+    narrowed_kwargs = _NARROWED_KWARGS.get(cls.__name__, frozenset())
+    for name, param in inspect.signature(BaseNode.__init__).parameters.items():
+        if param.default is inspect.Parameter.empty or name in kwargs or name in narrowed_kwargs:
+            continue
+        kwargs[name] = param.default
+
+    return kwargs
+
+
+@pytest.mark.parametrize("cls", _all_base_node_subclasses(), ids=lambda cls: cls.__name__)
+def test_base_node_subclass_constructs_with_forwarded_kwargs(cls, monkeypatch):
+    """Verify each `BaseNode` subclass can be constructed polymorphically."""
+    if "__init__" not in cls.__dict__:
+        pytest.skip(f"{cls.__name__} inherits __init__ from a parent")
+
+    for target in _INIT_CONSTRUCT_PATCHES.get(cls.__name__, ()):
+        monkeypatch.setattr(target, unittest.mock.MagicMock())
+
+    cls(**_build_init_kwargs(cls))
+
+
+def _cluster_classes_overriding_create_node() -> list[type]:
+    """Return all `BaseCluster` subclasses from the `sdcm` package that override `_create_node`."""
+    for module_name in _BACKEND_MODULES:
+        importlib.import_module(module_name)
+
+    all_subclasses = set()
+    stack = list(BaseCluster.__subclasses__())
+    while stack:
+        cls = stack.pop()
+        if cls not in all_subclasses:
+            all_subclasses.add(cls)
+            stack.extend(cls.__subclasses__())
+
+    production = [
+        cls for cls in all_subclasses if cls.__module__.startswith("sdcm.") and "_create_node" in cls.__dict__
+    ]
+    return sorted(production, key=lambda c: c.__name__)
+
+
+def _parent_create_node_kwargs(cls: type) -> dict | None:
+    """Build kwargs from the closest ancestor's `_create_node` signature, or None if no ancestor defines it."""
+    for ancestor in cls.__mro__[1:]:
+        if "_create_node" not in ancestor.__dict__:
+            continue
+
+        signature = inspect.signature(ancestor._create_node)
+        return {
+            name: (
+                param.default if param.default is not inspect.Parameter.empty else unittest.mock.MagicMock(name=name)
+            )
+            for name, param in signature.parameters.items()
+            if name != "self"
+        }
+    return None
+
+
+@pytest.mark.parametrize("cls", _cluster_classes_overriding_create_node(), ids=lambda cls: cls.__name__)
+def test_cluster_create_node_accepts_parent_kwargs(cls):
+    """Verify every `_create_node` override accepts the kwargs its parent's `add_nodes` forwards.
+
+    Bypasses cluster `__init__` via `__new__` — Python validates kwargs at the call
+    boundary before the body runs, so any TypeError about unexpected/missing/duplicate
+    kwargs surfaces a signature mismatch. Other exceptions come from the body running
+    against the bare cluster, which is unrelated to what we're checking.
+    """
+    kwargs = _parent_create_node_kwargs(cls)
+    if kwargs is None:
+        pytest.skip(f"{cls.__name__} has no ancestor with `_create_node`")
+
+    try:
+        cls._create_node(cls.__new__(cls), **kwargs)
+    except TypeError as exc:
+        if any(phrase in str(exc) for phrase in ("unexpected keyword argument", "got multiple values", "missing ")):
+            raise
+    except Exception:  # noqa: BLE001
+        pass
